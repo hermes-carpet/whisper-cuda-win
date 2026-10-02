@@ -307,8 +307,10 @@ jobs:
             cublas library"), so `ggml-cuda.dll` links static cudart + dynamic cuBLAS.
           - Kernels are nvcc-compiled to sm_75 SASS at build time (no NVRTC, no runtime
             JIT): cold start is instant; the binary is tied to the CUDA 12.9 build.
-          - Tests, examples, server, SDL2, cURL, OpenMP and native-CPU autotuning are off;
-            the CPU backend is a single baseline variant (not the multi-variant matrix).
+          - Tests, server, SDL2, cURL, OpenMP and native-CPU autotuning are off; only
+            `whisper-cli` is compiled (`--target`), so no other example executable builds.
+            The CPU backend is a single baseline variant (GGML_NATIVE=OFF, not the
+            multi-variant matrix).
 
           ## CI verification (GPU-less runner)
           - The CUDA binary cannot be *executed* on a hosted runner (it imports

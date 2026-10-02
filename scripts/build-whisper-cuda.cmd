@@ -98,11 +98,17 @@ where ninja
 if errorlevel 1 goto :err_no_tools
 
 rem --- compose the cmake configure line ---------------------------------------
-rem Common: release, no native autotuning, no OpenMP, no warnings-as-noise,
-rem       no NCCL, and the WHISPER_BUILD_EXAMPLES/TESTS/SERVER toggles (defaults
-rem       are ON when building standalone -- they MUST be off to keep examples/
-rem       off without WHISPER_BUILD_EXAMPLES, they were silently ignored before).
-set "CFG_ARGS=-GNinja -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=OFF -DGGML_OPENMP=OFF -DGGML_ALL_WARNINGS=OFF -DGGML_CUDA_NCCL=OFF -DWHISPER_BUILD_TESTS=OFF -DWHISPER_BUILD_EXAMPLES=OFF -DWHISPER_BUILD_SERVER=OFF -DWHISPER_SDL2=OFF -DWHISPER_CURL=OFF -DWHISPER_ALL_WARNINGS=OFF"
+rem NOTE: WHISPER_BUILD_EXAMPLES must stay ON (its default) -- the whisper-cli
+rem executable lives in examples/cli/ (confirmed upstream), so turning examples
+rem off deletes the very target we need. The other example executables are NOT
+rem wasted work in practice: we build with "--target whisper-cli", so ninja
+rem compiles only whisper-cli + its dep closure (common lib, whisper, ggml) --
+rem the rest are merely configured, never compiled.
+rem What actually gets turned off: tests, server example, SDL2, cURL, NVRTC
+rem (not linked by default), OpenMP, native-CPU autotuning (=> exactly ONE
+rem baseline ggml-cpu.dll, not the multi-variant matrix), and all warnings
+rem noise.
+set "CFG_ARGS=-GNinja -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=OFF -DGGML_OPENMP=OFF -DGGML_ALL_WARNINGS=OFF -DGGML_CUDA_NCCL=OFF -DWHISPER_BUILD_TESTS=OFF -DWHISPER_BUILD_SERVER=OFF -DWHISPER_SDL2=OFF -DWHISPER_CURL=OFF -DWHISPER_ALL_WARNINGS=OFF"
 if /I "!MODE_L!"=="cpu" (
   set "CFG_ARGS=!CFG_ARGS! -DGGML_CUDA=OFF"
 )
