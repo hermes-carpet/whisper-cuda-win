@@ -32,8 +32,9 @@ function Get-ImportDlLs {
 }
 foreach ($f in @('whisper-cli.exe','whisper.dll','ggml.dll','ggml-base.dll','ggml-cpu.dll','ggml-cuda.dll')) {
   $imports = Get-ImportDlLs -Path "$bin\$f"
-  $interesting = $imports | Where-Object { $_ -match 'cudart|cublas|nvrtc|nvcuda' }
-  Write-Host ("  {0,-18} nvidia-imports: {1}" -f $f, (if ($interesting) { $interesting -join ', ' } else { '(none)' }))
+  $interesting = @($imports | Where-Object { $_ -match 'cudart|cublas|nvrtc|nvcuda' })
+  $itext = if ($interesting.Count -gt 0) { $interesting -join ', ' } else { '(none)' }
+  Write-Host ("  {0,-18} nvidia-imports: {1}" -f $f, $itext)
   if ($imports -contains 'cudart64_12.dll') { throw "$f imports cudart64_12.dll - GGML_STATIC=ON (static cudart) did not take" }
 }
 $cuda = Get-ImportDlLs -Path "$bin\ggml-cuda.dll"
@@ -55,10 +56,12 @@ if ($sass -notmatch '/\*[0-9a-fA-F]+\*/') { throw "no SASS instruction lines (/*
 Write-Host "  SASS instructions present: OK"
 $targets = [regex]::Matches($sass, '(?m)^\s*\.target\s+(sm_\d+[a-f]?)') | ForEach-Object { $_.Groups[1].Value } | Sort-Object -Unique
 if (-not $targets) {
-  # newer fatbin layout: arch appears after".sass" header; fall back to any sm_NN
+  # newer fatbin layout: arch appears after the ".sass" header; fall back to any sm_NN
   $targets = [regex]::Matches($sass, 'sm_\d+[a-f]?') | ForEach-Object { $_.Value } | Sort-Object -Unique
 }
-Write-Host "  targets in SASS: $(if ($targets) { $targets -join ', ' } else { '(none parseable - see sass-dump.txt)' })"
+$targets = @($targets)
+$ttxt = if ($targets.Count -gt 0) { $targets -join ', ' } else { '(none parseable - see sass-dump.txt)' }
+Write-Host "  targets in SASS: $ttxt"
 if ($targets.Count -ge 1) {
   # When targets ARE parseable, sm_75 must be among them (else arch narrowing broke).
   if (($targets | Where-Object { $_ -match '^sm_75' }) -eq $null) { throw "sm_75 not present in SASS targets: $($targets -join ', ')" }
