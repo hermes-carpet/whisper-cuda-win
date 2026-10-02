@@ -90,7 +90,10 @@ jobs:
   build-windows:
     needs: check-upstream
     if: needs.check-upstream.outputs.changed == 'true'
-    runs-on: windows-latest
+    # PINNED: windows-latest rotated to the "windows-2025-vs2026" image (VS 2026
+    # only, no VS 2022) on 2026-09-25. nvcc 12.9 only supports VS 2017..2022,
+    # so the build must run on an image that still ships VS 2022.
+    runs-on: windows-2022
     timeout-minutes: 180
     env:
       UPSTREAM_SHA: ${{ needs.check-upstream.outputs.build_sha }}
