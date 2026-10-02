@@ -1,7 +1,14 @@
 # Auto-build whisper.cpp (whisper-cli) as a Windows CUDA 12.9 / Turing (sm_75)
 # package whenever upstream ggml-org/whisper.cpp (master) moves -- and only
-# publish a GitHub Release if it PASSES the CPU smoke test on the no-GPU
-# windows-latest runner.
+# publish a GitHub Release if the build passes BOTH:
+#   1. executable smoke test: a CPU-only build of the same commit transcribes
+#      samples/jfk.wav correctly (proves sources + toolchain are coherent);
+#   2. structural verification of the CUDA build: complete artifacts, static
+#      cudart (no cudart64_12.dll import), cuBLAS DLL, driver import, sm_75 SASS.
+#
+# The CUDA binary itself CANNOT be executed on a hosted runner: ggml-cuda.dll
+# imports nvcuda.dll (the NVIDIA driver, which only the target machine has), so
+# launching it there would die with 0xC0000135 (STATUS_DLL_NOT_FOUND) at load.
 #
 # Published (only on pass):
 #   GitHub Release <upstream-sha12>:
@@ -125,27 +132,45 @@ jobs:
       - name: Install Ninja
         uses: seanmiddleditch/gha-setup-ninja@v5
 
-      - name: Configure + build whisper-cli (sm_75 / Turing, CUDA 12.9)
+      - name: Build CUDA whisper-cli (sm_75 / Turing, CUDA 12.9)
         shell: cmd
         run: |
-          scripts\build-whisper-cuda.cmd > build.log 2>&1
+          scripts\build-whisper-cuda.cmd CUDA > build-cuda.log 2>&1
           if errorlevel 1 (
-            echo "=== build FAILED: last 50 lines of build.log ==="
-            powershell -NoProfile -Command "Get-Content build.log -Tail 50"
+            echo "=== CUDA build FAILED: last 60 lines of build-cuda.log ==="
+            powershell -NoProfile -Command "Get-Content build-cuda.log -Tail 60"
             exit /b 1
           )
-          echo "=== build OK: last 25 lines of build.log ==="
-          powershell -NoProfile -Command "Get-Content build.log -Tail 25"
+          echo "=== CUDA build OK: last 30 lines of build-cuda.log ==="
+          powershell -NoProfile -Command "Get-Content build-cuda.log -Tail 30"
 
-      - name: CPU smoke test (no-GPU runner must fall back to CPU and transcribe)
+      - name: Verify CUDA build (structural - no GPU on this runner)
+        shell: pwsh
+        run: |
+          # The CUDA binary cannot be executed here (no NVIDIA driver => 0xC0000135).
+          # Verify the artifacts instead: completeness, static cudart, DLL cuBLAS,
+          # driver import present, sm_75 SASS embedded, single-arch size.
+          $env:PATH = "$env:CUDA_PATH\bin;" + $env:PATH
+          . "$PWD\scripts\verify-cuda.ps1"
+
+      - name: Build CPU whisper-cli (no CUDA - for the executable smoke test)
+        shell: cmd
+        run: |
+          scripts\build-whisper-cuda.cmd CPU > build-cpu.log 2>&1
+          if errorlevel 1 (
+            echo "=== CPU build FAILED: last 60 lines of build-cpu.log ==="
+            powershell -NoProfile -Command "Get-Content build-cpu.log -Tail 60"
+            exit /b 1
+          )
+          echo "=== CPU build OK: last 20 lines of build-cpu.log ==="
+          powershell -NoProfile -Command "Get-Content build-cpu.log -Tail 20"
+
+      - name: CPU smoke test (transcribe jfk.wav with the CPU build)
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Continue'
-          # Make the CUDA 12.9 toolkit's bin (cuda.dll shim + cublas, etc.) resolvable so
-          # ggml-cuda.dll loads; with no GPU it must log "no GPU found" and run on CPU.
-          $env:PATH = "$env:CUDA_PATH\bin;" + $env:PATH
-          $exe = "$PWD\build\bin\whisper-cli.exe"
-          if (-not (Test-Path $exe)) { throw "whisper-cli.exe missing at $exe" }
+          $exe = "$PWD\build-cpu\bin\whisper-cli.exe"
+          if (-not (Test-Path $exe)) { throw "CPU whisper-cli.exe missing at $exe" }
 
           $wav = "$PWD\upstream\samples\jfk.wav"
           if (-not (Test-Path $wav)) { throw "jfk.wav not found at $wav" }
@@ -153,13 +178,13 @@ jobs:
           New-Item -ItemType Directory -Force -Path model | Out-Null
           $model = "$PWD\model\ggml-tiny.en.bin"
           if (-not (Test-Path $model)) {
-            Write-Host "Downloading ggml-tiny.en.bin (legacy .bin, same format as the shipped model)..."
+            Write-Host "Downloading ggml-tiny.en.bin..."
             Invoke-WebRequest "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.en.bin" -OutFile $model -UseBasicParsing
           }
           Write-Host ("model size: {0:N0} bytes" -f (Get-Item $model).Length)
 
           Write-Host "Running: $exe -m $model -f $wav -l en -nt"
-          & $exe -m $model -f $wav -l en -nt 2> transcribe.log
+          & $exe -m $model -f $wav -l en -nt > transcribe.log 2>&1
           $code = $LASTEXITCODE
           Write-Host "---- transcribe.log ----"
           Get-Content transcribe.log
@@ -221,15 +246,17 @@ jobs:
             Write-Host ("  {0,10:N0} KB  {1}" -f ($_.Length/1024), $_.Name)
           }
 
-      - name: Upload build log + artifact
+      - name: Upload build logs + artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: whisper-cuda-win-${{ env.UPSTREAM_SHA }}
           path: |
             whisper-cli-win-cuda12.9-*.zip
-            build.log
+            build-cuda.log
+            build-cpu.log
             transcribe.log
+            sass-dump.txt
           retention-days: 14
           if-no-files-found: warn
 
@@ -274,16 +301,26 @@ jobs:
 
           ## Build notes
           - CUDA 12.9 (Jimver/cuda-toolkit), `-DCMAKE_CUDA_ARCHITECTURES=75` (RTX 2060/2070/2080/Titan Xp).
-          - `GGML_STATIC=ON` => cudart statically linked (no `cudart64_12.dll` needed).
+          - `GGML_STATIC=ON` => cudart statically linked (no `cudart64_12.dll` needed) -- verified in CI.
           - cuBLAS stays a DLL -- NVIDIA ships no static `cublas.lib` for Windows (upstream
             `ggml/src/ggml-cuda/CMakeLists.txt`: "CUDA Toolkit for Windows does not offer a static
-            cublas library"), so `ggml-cuda.dll` links `cudart_static` + dynamic cublas.
-          - Kernels are nvcc-compiled to sm_75 SASS at build time (no runtime JIT/NVRTC): cold
-            start is instant, binary is tied to the CUDA 12.9 build.
-          - Tests, SDL2, server, OpenMP and native-CPU auto-detection are all off; the CPU backend
-            is a single baseline build (not the multi-variant matrix).
-          - CI smoke test runs `whisper-cli` on a no-GPU runner (CPU fallback) with
-            `ggml-tiny.en.bin` on `samples/jfk.wav`; a release is only published if that passes.
+            cublas library"), so `ggml-cuda.dll` links static cudart + dynamic cuBLAS.
+          - Kernels are nvcc-compiled to sm_75 SASS at build time (no NVRTC, no runtime
+            JIT): cold start is instant; the binary is tied to the CUDA 12.9 build.
+          - Tests, examples, server, SDL2, cURL, OpenMP and native-CPU autotuning are off;
+            the CPU backend is a single baseline variant (not the multi-variant matrix).
+
+          ## CI verification (GPU-less runner)
+          - The CUDA binary cannot be *executed* on a hosted runner (it imports
+            `nvcuda.dll`, the driver, which runners do not have -- would die with
+            0xC0000135 at load). Instead CI:
+            1. builds a CPU-only binary of the same commit and runs a real
+               transcription of `samples/jfk.wav` (tiny.en) -- must exit 0 and
+               contain the expected JFK keywords;
+            2. structurally verifies the CUDA artifacts: no `cudart64_12.dll`
+               import (cudart static), `cublas64_12.dll` + `nvcuda` imports
+               present, `ggml-cuda.dll` single-arch sized (~50-60 MB), sm_75
+               SASS embedded (cuobjdump + ELF note).
 
           ## Usage
           ```bat
