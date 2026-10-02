@@ -19,9 +19,10 @@ name: auto-rebuild-on-upstream
 
 on:
   schedule:
-    - cron: '*/30 * * * *'
-  push:
-    branches: [main]   # the self-commit re-triggers a no-op check, keeping the pipeline fresh
+    # Weekly, Tuesday 09:00 UTC: poll ggml-org/whisper.cpp master for
+    # commits newer than upstream-sha; if none, exits fast with no build.
+    # Matches hermes-carpet/llama-slim cadence (0 9 * * 2).
+    - cron: '0 9 * * 2'
   workflow_dispatch:
     inputs:
       upstream_sha:
@@ -41,11 +42,6 @@ permissions:
 concurrency:
   group: auto-rebuild-whisper-cuda
   cancel-in-progress: false
-
-# vcvarsall is per-batch; every Windows build step re-imports its env into the
-# pwsh session with the same one-liner.
-env:
-  VC_PATH: 'C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat'
 
 jobs:
   check-upstream:
@@ -123,60 +119,17 @@ jobs:
       - name: Install Ninja
         uses: seanmiddleditch/gha-setup-ninja@v5
 
-      - name: Show toolchain + CUDA layout
-        shell: pwsh
+      - name: Configure + build whisper-cli (sm_75 / Turing, CUDA 12.9)
+        shell: cmd
         run: |
-          & cmd /c "`"$env:VC_PATH`" x64 && set" | ForEach-Object {
-            if ($_ -match '^([^=]+)=(.*)$') { Set-Item -Path "env:$($matches[1])" -Value $matches[2] }
-          }
-          cl 2>&1 | Select-Object -First 2 | Out-Host
-          nvcc --version
-          Write-Host "CUDA_PATH = $env:CUDA_PATH"
-          Write-Host ("cublas64_12.dll:     " + (Test-Path "$env:CUDA_PATH\bin\cublas64_12.dll"))
-          Write-Host ("cublasLt64_12.dll:   " + (Test-Path "$env:CUDA_PATH\bin\cublasLt64_12.dll"))
-          Write-Host ("cuda.dll (shim):     " + (Test-Path "$env:CUDA_PATH\bin\cuda.dll"))
-          Write-Host ("cudart64_12.dll:     " + (Test-Path "$env:CUDA_PATH\bin\cudart64_12.dll"))
-
-      - name: Configure (sm_75 / Turing, CUDA 12.9)
-        shell: pwsh
-        run: |
-          & cmd /c "`"$env:VC_PATH`" x64 && set" | ForEach-Object {
-            if ($_ -match '^([^=]+)=(.*)$') { Set-Item -Path "env:$($matches[1])" -Value $matches[2] }
-          }
-          $ErrorActionPreference = 'Stop'
-          cmake -B "$PWD\build" -S upstream -G "Ninja" \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_CUDA_ARCHITECTURES=75 \
-            -DGGML_CUDA=ON \
-            -DGGML_STATIC=ON \
-            -DGGML_NATIVE=OFF \
-            -DGGML_OPENMP=OFF \
-            -DGGML_ALL_WARNINGS=OFF \
-            -DGGML_CUDA_NCCL=OFF \
-            -DWHISPER_BUILD_TESTS=OFF \
-            -DWHISPER_BUILD_SERVER=OFF \
-            -DWHISPER_SDL2=OFF \
-            -DWHISPER_CURL=OFF \
-            -DWHISPER_ALL_WARNINGS=OFF *>&1 | Tee-Object cmake-configure.log
-          if ($LASTEXITCODE -ne 0) { throw "cmake configure failed (exit $LASTEXITCODE); see cmake-configure.log" }
-
-      - name: Build whisper-cli (dependency closure only)
-        shell: pwsh
-        run: |
-          & cmd /c "`"$env:VC_PATH`" x64 && set" | ForEach-Object {
-            if ($_ -match '^([^=]+)=(.*)$') { Set-Item -Path "env:$($matches[1])" -Value $matches[2] }
-          }
-          $ErrorActionPreference = 'Stop'
-          $cpu = [Environment]::ProcessorCount
-          Write-Host "building with -j $cpu"
-          cmake --build "$PWD\build" --target whisper-cli -j $cpu *>&1 | Tee-Object build.log
-          if ($LASTEXITCODE -ne 0) {
-            Write-Host "=== tail of build.log ==="
-            Select-String -Path build.log -Pattern 'error C|fatal error|error LNK|: error' | Select-Object -Last 40 | Out-Host
-            throw "cmake --build failed (exit $LASTEXITCODE)"
-          }
-          Write-Host "build OK (log: build.log)"
-          Get-ChildItem "$PWD\build\bin" | ForEach-Object { "{0,12:N0}  {1}" -f $_.Length, $_.Name }
+          scripts\build-whisper-cuda.cmd > build.log 2>&1
+          if errorlevel 1 (
+            echo "=== build FAILED: last 50 lines of build.log ==="
+            powershell -NoProfile -Command "Get-Content build.log -Tail 50"
+            exit /b 1
+          )
+          echo "=== build OK: last 25 lines of build.log ==="
+          powershell -NoProfile -Command "Get-Content build.log -Tail 25"
 
       - name: CPU smoke test (no-GPU runner must fall back to CPU and transcribe)
         shell: pwsh
@@ -270,7 +223,6 @@ jobs:
           path: |
             whisper-cli-win-cuda12.9-*.zip
             build.log
-            cmake-configure.log
             transcribe.log
           retention-days: 14
           if-no-files-found: warn
