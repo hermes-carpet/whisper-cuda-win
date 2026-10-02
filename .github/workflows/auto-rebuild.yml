@@ -1,0 +1,363 @@
+# Auto-build whisper.cpp (whisper-cli) as a Windows CUDA 12.9 / Turing (sm_75)
+# package whenever upstream ggml-org/whisper.cpp (master) moves -- and only
+# publish a GitHub Release if it PASSES the CPU smoke test on the no-GPU
+# windows-latest runner.
+#
+# Published (only on pass):
+#   GitHub Release <upstream-sha12>:
+#     whisper-cli-win-cuda12.9-<sha12>.zip         (slim: system CUDA 12.9 cuBLAS)
+#     whisper-cli-win-cuda12.9-<sha12>-cublas.zip  (portable: bundles cuBLAS)
+#
+# State: `upstream-sha` in the repo root = last published upstream SHA.
+#
+# This mirrors hermes-carpet/llama-slim: a 30-min cron keeps the pipeline
+# active, and a successful poll self-commits the new upstream SHA back to
+# this repo. A failed build/test publishes nothing and leaves the last
+# passing release in place.
+
+name: auto-rebuild-on-upstream
+
+on:
+  schedule:
+    - cron: '*/30 * * * *'
+  push:
+    branches: [main]   # the self-commit re-triggers a no-op check, keeping the pipeline fresh
+  workflow_dispatch:
+    inputs:
+      upstream_sha:
+        description: 'Explicit upstream commit to build (default: latest master)'
+        required: false
+        default: ''
+      force:
+        description: 'Rebuild even if SHA already published'
+        required: false
+        default: 'false'
+        type: choice
+        options: ['false', 'true']
+
+permissions:
+  contents: write
+
+concurrency:
+  group: auto-rebuild-whisper-cuda
+  cancel-in-progress: false
+
+# vcvarsall is per-batch; every Windows build step re-imports its env into the
+# pwsh session with the same one-liner.
+env:
+  VC_PATH: 'C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat'
+
+jobs:
+  check-upstream:
+    runs-on: ubuntu-24.04
+    outputs:
+      build_sha: ${{ steps.check.outputs.build_sha }}
+      changed: ${{ steps.check.outputs.changed }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Resolve latest upstream master SHA
+        id: latest
+        run: |
+          set -euo pipefail
+          sha=$(curl -fsSL \
+                  -H "Accept: application/vnd.github+json" \
+                  -H "User-Agent: hermes-carpet-whisper-cuda-ci" \
+                  https://api.github.com/repos/ggml-org/whisper.cpp/commits/master \
+                | python3 -c "import json,sys; print(json.load(sys.stdin)['sha'])")
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "Upstream master: $sha"
+
+      - name: Compare with published SHA
+        id: check
+        run: |
+          set -euo pipefail
+          latest="${{ steps.latest.outputs.sha }}"
+          explicit="${{ inputs.upstream_sha }}"
+          force="${{ inputs.force }}"
+          if [ -n "$explicit" ]; then latest="$explicit"; fi
+          current=$(cat upstream-sha 2>/dev/null || echo "")
+          echo "published_sha=${current:-<none>}"
+          echo "candidate_sha=$latest"
+          if [ "$latest" = "$current" ] && [ "$force" != "true" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "build_sha=" >> "$GITHUB_OUTPUT"
+            echo "Already published, nothing to do."
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "build_sha=$latest" >> "$GITHUB_OUTPUT"
+          fi
+
+  build-windows:
+    needs: check-upstream
+    if: needs.check-upstream.outputs.changed == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 180
+    env:
+      UPSTREAM_SHA: ${{ needs.check-upstream.outputs.build_sha }}
+      CUDA_VER: '12.9.0'
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Fetch upstream whisper.cpp at candidate SHA (ggml vendored, no submodules)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path upstream | Out-Null
+          Push-Location upstream
+          git init -q
+          git remote add origin https://github.com/ggml-org/whisper.cpp
+          git fetch -q --depth 1 origin $env:UPSTREAM_SHA
+          git checkout -q FETCH_HEAD
+          Write-Host "checked out $(git rev-parse HEAD)"
+          # ggml is vendored as a plain directory (no .gitmodules) -- nothing to recurse.
+          Pop-Location
+
+      - name: Install CUDA Toolkit 12.9.0
+        uses: Jimver/cuda-toolkit@v0.2.21
+        id: cuda
+        with:
+          cuda: ${{ env.CUDA_VER }}
+          method: 'network'
+
+      - name: Install Ninja
+        uses: seanmiddleditch/gha-setup-ninja@v5
+
+      - name: Show toolchain + CUDA layout
+        shell: pwsh
+        run: |
+          & cmd /c "`"$env:VC_PATH`" x64 && set" | ForEach-Object {
+            if ($_ -match '^([^=]+)=(.*)$') { Set-Item -Path "env:$($matches[1])" -Value $matches[2] }
+          }
+          cl 2>&1 | Select-Object -First 2 | Out-Host
+          nvcc --version
+          Write-Host "CUDA_PATH = $env:CUDA_PATH"
+          Write-Host ("cublas64_12.dll:     " + (Test-Path "$env:CUDA_PATH\bin\cublas64_12.dll"))
+          Write-Host ("cublasLt64_12.dll:   " + (Test-Path "$env:CUDA_PATH\bin\cublasLt64_12.dll"))
+          Write-Host ("cuda.dll (shim):     " + (Test-Path "$env:CUDA_PATH\bin\cuda.dll"))
+          Write-Host ("cudart64_12.dll:     " + (Test-Path "$env:CUDA_PATH\bin\cudart64_12.dll"))
+
+      - name: Configure (sm_75 / Turing, CUDA 12.9)
+        shell: pwsh
+        run: |
+          & cmd /c "`"$env:VC_PATH`" x64 && set" | ForEach-Object {
+            if ($_ -match '^([^=]+)=(.*)$') { Set-Item -Path "env:$($matches[1])" -Value $matches[2] }
+          }
+          $ErrorActionPreference = 'Stop'
+          cmake -B "$PWD\build" -S upstream -G "Ninja" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CUDA_ARCHITECTURES=75 \
+            -DGGML_CUDA=ON \
+            -DGGML_STATIC=ON \
+            -DGGML_NATIVE=OFF \
+            -DGGML_OPENMP=OFF \
+            -DGGML_ALL_WARNINGS=OFF \
+            -DGGML_CUDA_NCCL=OFF \
+            -DWHISPER_BUILD_TESTS=OFF \
+            -DWHISPER_BUILD_SERVER=OFF \
+            -DWHISPER_SDL2=OFF \
+            -DWHISPER_CURL=OFF \
+            -DWHISPER_ALL_WARNINGS=OFF *>&1 | Tee-Object cmake-configure.log
+          if ($LASTEXITCODE -ne 0) { throw "cmake configure failed (exit $LASTEXITCODE); see cmake-configure.log" }
+
+      - name: Build whisper-cli (dependency closure only)
+        shell: pwsh
+        run: |
+          & cmd /c "`"$env:VC_PATH`" x64 && set" | ForEach-Object {
+            if ($_ -match '^([^=]+)=(.*)$') { Set-Item -Path "env:$($matches[1])" -Value $matches[2] }
+          }
+          $ErrorActionPreference = 'Stop'
+          $cpu = [Environment]::ProcessorCount
+          Write-Host "building with -j $cpu"
+          cmake --build "$PWD\build" --target whisper-cli -j $cpu *>&1 | Tee-Object build.log
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "=== tail of build.log ==="
+            Select-String -Path build.log -Pattern 'error C|fatal error|error LNK|: error' | Select-Object -Last 40 | Out-Host
+            throw "cmake --build failed (exit $LASTEXITCODE)"
+          }
+          Write-Host "build OK (log: build.log)"
+          Get-ChildItem "$PWD\build\bin" | ForEach-Object { "{0,12:N0}  {1}" -f $_.Length, $_.Name }
+
+      - name: CPU smoke test (no-GPU runner must fall back to CPU and transcribe)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          # Make the CUDA 12.9 toolkit's bin (cuda.dll shim + cublas, etc.) resolvable so
+          # ggml-cuda.dll loads; with no GPU it must log "no GPU found" and run on CPU.
+          $env:PATH = "$env:CUDA_PATH\bin;" + $env:PATH
+          $exe = "$PWD\build\bin\whisper-cli.exe"
+          if (-not (Test-Path $exe)) { throw "whisper-cli.exe missing at $exe" }
+
+          $wav = "$PWD\upstream\samples\jfk.wav"
+          if (-not (Test-Path $wav)) { throw "jfk.wav not found at $wav" }
+
+          New-Item -ItemType Directory -Force -Path model | Out-Null
+          $model = "$PWD\model\ggml-tiny.en.bin"
+          if (-not (Test-Path $model)) {
+            Write-Host "Downloading ggml-tiny.en.bin (legacy .bin, same format as the shipped model)..."
+            Invoke-WebRequest "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.en.bin" -OutFile $model -UseBasicParsing
+          }
+          Write-Host ("model size: {0:N0} bytes" -f (Get-Item $model).Length)
+
+          Write-Host "Running: $exe -m $model -f $wav -l en -nt"
+          & $exe -m $model -f $wav -l en -nt 2> transcribe.log
+          $code = $LASTEXITCODE
+          Write-Host "---- transcribe.log ----"
+          Get-Content transcribe.log
+          if ($code -ne 0) { throw "whisper-cli exited $code on CPU smoke test (see transcribe.log)" }
+          $txt = Get-Content transcribe.log -Raw
+          if ($txt -notimatch 'that is|country|american|fellow|ask not|your|that no') {
+            Write-Host "WARN: transcript did not match expected JFK keywords: $txt"
+          }
+          Write-Host "CPU smoke test PASSED"
+
+      - name: Package slim (system cuBLAS) + portable (bundled cuBLAS)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $sha = ($env:UPSTREAM_SHA).Substring(0,12)
+          New-Item -ItemType Directory -Force -Path dist\slim | Out-Null
+
+          # Copy the built exe + every DLL the build produced in bin\. With --target
+          # whisper-cli the set is exactly { whisper-cli.exe whisper.dll ggml.dll
+          # ggml-base.dll ggml-cpu.dll ggml-cuda.dll } -- nothing else is built.
+          Copy-Item "$PWD\build\bin\whisper-cli.exe" dist\slim\
+          Get-ChildItem "$PWD\build\bin" -Filter '*.dll' | ForEach-Object {
+            Copy-Item $_.FullName dist\slim\
+          }
+          Write-Host "Slim payload:"
+          Get-ChildItem dist\slim | ForEach-Object { Write-Host ("  {0,12:N0}  {1}" -f $_.Length, $_.Name) }
+
+          # Launcher resolves CUDA 12.9 via CUDA_PATH_V12_9 (toolkit-set) over a polluted
+          # PATH, so cuBLAS/cuDART load from the 12.9 install on the target machine.
+          [IO.File]::WriteAllLines("$PWD\dist\slim\whisper.bat", @(
+            '@echo off',
+            'rem whisper-cuda launcher: prefer CUDA 12.9 via CUDA_PATH_V12_9 (toolkit-set)',
+            'rem so cuBLAS/cuDART resolve from the 12.9 install, not from a polluted PATH.',
+            'if "%CUDA_PATH_V12_9%"=="" (',
+            '  echo [whisper-cuda] WARNING: CUDA_PATH_V12_9 is not set on this machine.',
+            '  echo [whisper-cuda]   cuBLAS/cuDART must come from the CUDA 12.9 toolkit.',
+            '  echo [whisper-cuda]   Fix: set CUDA_PATH_V12_9 to your CUDA 12.9 install dir,',
+            '  echo [whisper-cuda]   e.g. C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.9',
+            '  echo [whisper-cuda]   (the CUDA 12.9 toolkit normally sets this) and re-run.',
+            ') else (',
+            '  set "PATH=%CUDA_PATH_V12_9%\bin;%PATH%"',
+            ')',
+            '"%~dp0whisper-cli.exe" %*'
+          ), [Text.Encoding]::ASCII)
+
+          # Slim zip: exe + ggml/whisper DLLs + launcher. cuBLAS comes from system CUDA 12.9.
+          Compress-Archive -Path dist\slim\* -DestinationPath "whisper-cli-win-cuda12.9-$sha.zip" -Force
+
+          # Portable zip: same, but bundle cuBLAS from the toolkit's bin for CUDA-less machines.
+          New-Item -ItemType Directory -Force -Path dist\full | Out-Null
+          Copy-Item dist\slim\* dist\full\ -Force
+          Get-ChildItem "$env:CUDA_PATH\bin" -Filter 'cublas*.dll' | ForEach-Object {
+            Copy-Item $_.FullName dist\full\ -Force
+          }
+          Compress-Archive -Path dist\full\* -DestinationPath "whisper-cli-win-cuda12.9-$sha-cublas.zip" -Force
+
+          Write-Host "=== release zips ==="
+          Get-ChildItem "$PWD" -Filter 'whisper-cli-*.zip' | ForEach-Object {
+            Write-Host ("  {0,10:N0} KB  {1}" -f ($_.Length/1024), $_.Name)
+          }
+
+      - name: Upload build log + artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: whisper-cuda-win-${{ env.UPSTREAM_SHA }}
+          path: |
+            whisper-cli-win-cuda12.9-*.zip
+            build.log
+            cmake-configure.log
+            transcribe.log
+          retention-days: 14
+          if-no-files-found: warn
+
+  release:
+    needs: [check-upstream, build-windows]
+    if: always() && needs.build-windows.result == 'success'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: whisper-cuda-win-${{ needs.check-upstream.outputs.build_sha }}
+          path: artifacts
+
+      - name: Create GitHub Release (only on pass)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          sha="${{ needs.check-upstream.outputs.build_sha }}"
+          short="${sha:0:12}"
+          tag="whisper-${short}"
+          # idempotent: a prior run (force) may have already created this tag
+          gh api -X DELETE "repos/${{ github.repository }}/releases/tags/${tag}" >/dev/null 2>&1 || true
+
+          cat > release-body.md <<BODY
+          Auto-built from `ggml-org/whisper.cpp` @ `${sha}` (CUDA 12.9, sm_75 / Turing).
+
+          ## Windows host requirements
+          - NVIDIA GPU driver installed (provides `nvcuda.dll`).
+          - cuBLAS 12.x resolvable. Two zips:
+            - **slim** -- relies on your system CUDA 12.9 toolkit. `whisper.bat`
+              puts `%CUDA_PATH_V12_9%` + `\bin` first on PATH so cuBLAS/cuDART load from the
+              12.9 install, not a polluted PATH. If `CUDA_PATH_V12_9` is unset the wrapper
+              prints exactly what to set.
+            - **cublas** -- bundles `cublas*.dll` from the toolkit for machines without CUDA.
+
+          ## Files
+          - `whisper-cli.exe` -- the CLI
+          - `ggml-cuda.dll` (~60-100 MB after the sm_75 single-arch cut)
+          - `ggml.dll`, `ggml-base.dll`, `ggml-cpu.dll`, `whisper.dll`
+          - `whisper.bat` -- launcher that resolves CUDA 12.9 via `CUDA_PATH_V12_9`
+
+          ## Build notes
+          - CUDA 12.9 (Jimver/cuda-toolkit), `-DCMAKE_CUDA_ARCHITECTURES=75` (RTX 2060/2070/2080/Titan Xp).
+          - `GGML_STATIC=ON` => cudart statically linked (no `cudart64_12.dll` needed).
+          - cuBLAS stays a DLL -- NVIDIA ships no static `cublas.lib` for Windows (upstream
+            `ggml/src/ggml-cuda/CMakeLists.txt`: "CUDA Toolkit for Windows does not offer a static
+            cublas library"), so `ggml-cuda.dll` links `cudart_static` + dynamic cublas.
+          - Kernels are nvcc-compiled to sm_75 SASS at build time (no runtime JIT/NVRTC): cold
+            start is instant, binary is tied to the CUDA 12.9 build.
+          - Tests, SDL2, server, OpenMP and native-CPU auto-detection are all off; the CPU backend
+            is a single baseline build (not the multi-variant matrix).
+          - CI smoke test runs `whisper-cli` on a no-GPU runner (CPU fallback) with
+            `ggml-tiny.en.bin` on `samples/jfk.wav`; a release is only published if that passes.
+
+          ## Usage
+          ```bat
+          whisper.bat -m yourmodel.bin -f audio.wav -l en
+          ```
+          BODY
+
+          gh release create "${tag}" \
+            "artifacts/whisper-cli-win-cuda12.9-${short}.zip" \
+            "artifacts/whisper-cli-win-cuda12.9-${short}-cublas.zip" \
+            --title "whisper-cli CUDA 12.9 (Turing sm_75) -- ${short}" \
+            --body-file release-body.md
+
+  commit-sha:
+    # Self-commit the newly published upstream SHA back to this repo. This push is the
+    # llama-slim keepalive pattern -- it keeps the pipeline fresh and re-triggers cleanly.
+    needs: [check-upstream, release]
+    if: ${{ needs.release.result == 'success' }}
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+      - name: Commit + push new published SHA
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          echo "${{ needs.check-upstream.outputs.build_sha }}" > upstream-sha
+          git config user.name  "hermes-carpet"
+          git config user.email "hermes-carpet@users.noreply.github.com"
+          git add upstream-sha
+          git commit -m "auto-rebuild: publish whisper-cuda build for upstream ${{ needs.check-upstream.outputs.build_sha }}"
+          git push
+          echo "pushed new upstream-sha"
