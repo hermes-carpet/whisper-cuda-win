@@ -165,7 +165,7 @@ jobs:
           Get-Content transcribe.log
           if ($code -ne 0) { throw "whisper-cli exited $code on CPU smoke test (see transcribe.log)" }
           $txt = Get-Content transcribe.log -Raw
-          if ($txt -notimatch 'that is|country|american|fellow|ask not|your|that no') {
+          if ($txt -notmatch 'that is|country|american|fellow|ask not|your|that no') {
             Write-Host "WARN: transcript did not match expected JFK keywords: $txt"
           }
           Write-Host "CPU smoke test PASSED"
