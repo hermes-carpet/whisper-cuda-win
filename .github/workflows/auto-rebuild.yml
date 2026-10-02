@@ -114,7 +114,7 @@ jobs:
           Pop-Location
 
       - name: Install CUDA Toolkit 12.9.0
-        uses: Jimver/cuda-toolkit@v0.2.21
+        uses: Jimver/cuda-toolkit@v0.2.36
         id: cuda
         with:
           cuda: ${{ env.CUDA_VER }}
