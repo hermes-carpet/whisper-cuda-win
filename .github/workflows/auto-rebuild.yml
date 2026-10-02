@@ -256,7 +256,7 @@ jobs:
             build-cuda.log
             build-cpu.log
             transcribe.log
-            sass-dump.txt
+            sass-targets.txt
           retention-days: 14
           if-no-files-found: warn
 
