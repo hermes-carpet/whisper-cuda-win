@@ -264,7 +264,14 @@ jobs:
     needs: [check-upstream, build-windows]
     if: always() && needs.build-windows.result == 'success'
     runs-on: ubuntu-24.04
+    permissions:
+      contents: write   # needed by `gh release create`
     steps:
+      - uses: actions/checkout@v6
+        with:
+          # fetch this repo's git objects so gh release create can resolve
+          # the target SHA / create+push the tag (it shells out to git).
+          fetch-depth: 0
       - uses: actions/download-artifact@v4
         with:
           name: whisper-cuda-win-${{ needs.check-upstream.outputs.build_sha }}
@@ -333,11 +340,20 @@ jobs:
           ```
           BODY
 
-          gh release create "${tag}" \
+          # Create the release via REST (no local git / tag-pushing; the runner
+          # isn't a checkout target for that). target_commitish is omitted on
+          # purpose: build_sha is the *upstream whisper.cpp* commit, which does
+          # not exist in THIS repo. Default = default branch HEAD.
+          release_id=$(GH_TOKEN="$GH_TOKEN" gh api \
+            -X POST "repos/${{ github.repository }}/releases" \
+            -f "tag_name=${tag}" \
+            -f "name=whisper-cli CUDA 12.9 (Turing sm_75) -- ${short}" \
+            -F "body=@release-body.md" \
+            --jq '.id')
+
+          GH_TOKEN="$GH_TOKEN" gh release upload "${tag}" \
             "artifacts/whisper-cli-win-cuda12.9-${short}.zip" \
-            "artifacts/whisper-cli-win-cuda12.9-${short}-cublas.zip" \
-            --title "whisper-cli CUDA 12.9 (Turing sm_75) -- ${short}" \
-            --notes-file release-body.md
+            "artifacts/whisper-cli-win-cuda12.9-${short}-cublas.zip" --clobber
 
   commit-sha:
     # Self-commit the newly published upstream SHA back to this repo. This push is the
