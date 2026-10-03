@@ -115,8 +115,9 @@ jobs:
           sha="${{ steps.check.outputs.build_sha }}"
           v=""
           if [ -n "$sha" ]; then
+            # raw.githubusercontent.com is PUBLIC -- no token needed (a bearer
+            # token on this host is unnecessary and can even fail). Fetch plain.
             cm=$(curl -fsSL \
-                  -H "Authorization: Bearer ***" \
                   "https://raw.githubusercontent.com/ggml-org/whisper.cpp/${sha}/CMakeLists.txt" || echo "")
             maj=$(printf '%s\n' "$cm" | sed -nE 's/^set\(WHISPER_VERSION_MAJOR ([0-9]+).*/\1/p' | head -1)
             min=$(printf '%s\n' "$cm" | sed -nE 's/^set\(WHISPER_VERSION_MINOR ([0-9]+).*/\1/p' | head -1)
