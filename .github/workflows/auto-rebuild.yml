@@ -281,21 +281,24 @@ jobs:
           # idempotent: a prior run (force) may have already created this tag
           gh api -X DELETE "repos/${{ github.repository }}/releases/tags/${tag}" >/dev/null 2>&1 || true
 
-          cat > release-body.md <<BODY
-          Auto-built from `ggml-org/whisper.cpp` @ `${sha}` (CUDA 12.9, sm_75 / Turing).
+          # QUOTED heredoc delimiter (<<'BODY'): the body contains backticks
+          # (inline code) and must be written verbatim -- unquoted <<BODY runs
+          # them as command substitution. ${sha} is a real shell var, set above.
+          cat > release-body.md <<'BODY'
+          Auto-built from `ggml-org/whisper.cpp` at commit `${sha}` (CUDA 12.9, sm_75 / Turing).
 
           ## Windows host requirements
           - NVIDIA GPU driver installed (provides `nvcuda.dll`).
           - cuBLAS 12.x resolvable. Two zips:
             - **slim** -- relies on your system CUDA 12.9 toolkit. `whisper.bat`
-              puts `%CUDA_PATH_V12_9%` + `\bin` first on PATH so cuBLAS/cuDART load from the
-              12.9 install, not a polluted PATH. If `CUDA_PATH_V12_9` is unset the wrapper
-              prints exactly what to set.
+              puts `%CUDA_PATH_V12_9%\bin` first on PATH so cuBLAS loads from the
+              12.9 install, not a polluted PATH. If `CUDA_PATH_V12_9` is unset the
+              wrapper prints exactly what to set and exits.
             - **cublas** -- bundles `cublas*.dll` from the toolkit for machines without CUDA.
 
           ## Files
           - `whisper-cli.exe` -- the CLI
-          - `ggml-cuda.dll` (~60-100 MB after the sm_75 single-arch cut)
+          - `ggml-cuda.dll` (~50-60 MB after the sm_75 single-arch cut)
           - `ggml.dll`, `ggml-base.dll`, `ggml-cpu.dll`, `whisper.dll`
           - `whisper.bat` -- launcher that resolves CUDA 12.9 via `CUDA_PATH_V12_9`
 
@@ -322,7 +325,7 @@ jobs:
             2. structurally verifies the CUDA artifacts: no `cudart64_12.dll`
                import (cudart static), `cublas64_12.dll` + `nvcuda` imports
                present, `ggml-cuda.dll` single-arch sized (~50-60 MB), sm_75
-               SASS embedded (cuobjdump + ELF note).
+               SASS embedded (verified via cuobjdump).
 
           ## Usage
           ```bat
@@ -334,7 +337,7 @@ jobs:
             "artifacts/whisper-cli-win-cuda12.9-${short}.zip" \
             "artifacts/whisper-cli-win-cuda12.9-${short}-cublas.zip" \
             --title "whisper-cli CUDA 12.9 (Turing sm_75) -- ${short}" \
-            --body-file release-body.md
+            --notes-file release-body.md
 
   commit-sha:
     # Self-commit the newly published upstream SHA back to this repo. This push is the
