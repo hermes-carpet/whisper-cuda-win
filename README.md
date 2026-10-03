@@ -3,13 +3,19 @@
 Auto-built **`whisper-cli` for Windows 10 + NVIDIA GTX/RTX 2060 (Turing, sm_75)**,
 tuned for CUDA 12.9. Built entirely on GitHub Actions — nothing to install here.
 
-Mirrors the `hermes-carpet/llama-slim` pattern: a **30-minute cron** polls
-`ggml-org/whisper.cpp` master. When a new upstream commit appears and the build
+Mirrors the `hermes-carpet/llama-slim` pattern: a **weekly cron** (Tue 09:00 UTC)
+polls `ggml-org/whisper.cpp` master. When a new upstream commit appears and the build
 **passes a CPU smoke test** on the no-GPU runner, it publishes a GitHub Release
 and **self-commits** the published SHA back to this repo. That self-commit keeps
 the pipeline fresh (no GitHub inactivity timeout) and is the next poll's "already
 done" marker. A failed build or test publishes nothing — the last passing release
 stays.
+
+Each release is named **`whisper-v<version>`** where the version is parsed from
+upstream `CMakeLists.txt` (e.g. `v1.9.4`). If the commit is between upstream tags
+(a dev build), the tag/notes read **`v<version>-dev`** so the number isn't mistaken
+for the tagged release. Asset *filenames* use the 12-char SHA — unchanged since
+the build step names the zips before the release step resolves the label.
 
 Grab the latest build from **Releases** → `whisper-cli-win-cuda12.9-<sha>.zip`.
 
@@ -63,7 +69,7 @@ Or call `whisper-cli.exe` directly if you already have CUDA 12.9 on `PATH`.
 
 `.github/workflows/auto-rebuild.yml`:
 
-- **Every 30 minutes** (`schedule`) — polls `ggml-org/whisper.cpp` master.
+- **Weekly** (`schedule`): Tuesday 09:00 UTC — polls `ggml-org/whisper.cpp` master.
 - **`workflow_dispatch`** — manual; pass `upstream_sha` (optional) and `force`
   to rebuild a specific/published SHA.
 

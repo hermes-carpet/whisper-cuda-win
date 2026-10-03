@@ -11,16 +11,17 @@
 # launching it there would die with 0xC0000135 (STATUS_DLL_NOT_FOUND) at load.
 #
 # Published (only on pass):
-#   GitHub Release <upstream-sha12>:
+#   GitHub Release whisper-v<ver>  (e.g. whisper-v1.9.4, or whisper-v1.9.4-dev
+#   if the commit is between tags; version parsed from upstream CMakeLists.txt):
 #     whisper-cli-win-cuda12.9-<sha12>.zip         (slim: system CUDA 12.9 cuBLAS)
 #     whisper-cli-win-cuda12.9-<sha12>-cublas.zip  (portable: bundles cuBLAS)
 #
 # State: `upstream-sha` in the repo root = last published upstream SHA.
 #
-# This mirrors hermes-carpet/llama-slim: a 30-min cron keeps the pipeline
-# active, and a successful poll self-commits the new upstream SHA back to
-# this repo. A failed build/test publishes nothing and leaves the last
-# passing release in place.
+# This mirrors hermes-carpet/llama-slim: a weekly cron (Tue 09:00 UTC) polls
+# ggml-org/whisper.cpp master and a successful poll self-commits the new
+# upstream SHA back to this repo (keepalive / no GitHub inactivity timeout).
+# A failed build/test publishes nothing and leaves the last passing release.
 
 name: auto-rebuild-on-upstream
 
@@ -56,6 +57,7 @@ jobs:
     outputs:
       build_sha: ${{ steps.check.outputs.build_sha }}
       changed: ${{ steps.check.outputs.changed }}
+      version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@v6
 
@@ -93,6 +95,36 @@ jobs:
             echo "changed=true" >> "$GITHUB_OUTPUT"
             echo "build_sha=$latest" >> "$GITHUB_OUTPUT"
           fi
+
+      - name: Resolve upstream version (human-readable) for release naming
+        id: version
+        run: |
+          set -euo pipefail
+          # whisper.cpp keeps its SemVer in CMakeLists.txt as three variables
+          # (WHISPER_VERSION_MAJOR / MINOR / PATCH). A tag (vX.Y.Z) is NOT a
+          # separate version file, so parse the CMake values at the target SHA.
+          sha="${{ steps.check.outputs.build_sha }}"
+          v=""
+          if [ -n "$sha" ]; then
+            cm=$(curl -fsSL \
+                  -H "Authorization: Bearer ${GITHUB_TOKEN:-}" \
+                  "https://raw.githubusercontent.com/ggml-org/whisper.cpp/${sha}/CMakeLists.txt" || echo "")
+            # Only resolve when building (changed=true); a no-op run has empty sha.
+            maj=$(printf '%s\n' "$cm" | sed -nE 's/^set\(WHISPER_VERSION_MAJOR ([0-9]+).*/\1/p' | head -1)
+            min=$(printf '%s\n' "$cm" | sed -nE 's/^set\(WHISPER_VERSION_MINOR ([0-9]+).*/\1/p' | head -1)
+            pat=$(printf '%s\n' "$cm" | sed -nE 's/^set\(WHISPER_VERSION_PATCH ([0-9]+).*/\1/p' | head -1)
+            if [ -n "${maj}${min}${pat}" ]; then
+              v="${maj}.${min}.${pat}"
+            fi
+          fi
+          if [ -n "$v" ]; then
+            echo "version=$v" >> "$GITHUB_OUTPUT"
+            echo "Upstream version: $v (sha=${sha:0:12})"
+          else
+            echo "version= (unresolved -- release will use bare sha)" >> "$GITHUB_OUTPUT"
+          fi
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   build-windows:
     needs: check-upstream
@@ -280,20 +312,63 @@ jobs:
       - name: Create GitHub Release (only on pass)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BUILD_SHA: ${{ needs.check-upstream.outputs.build_sha }}
+          UPSTREAM_VERSION: ${{ needs.check-upstream.outputs.version }}
         run: |
           set -euo pipefail
           sha="${{ needs.check-upstream.outputs.build_sha }}"
           short="${sha:0:12}"
-          tag="whisper-${short}"
+
+          # --- Build a human-readable version string -------------------------
+          # The commit might be an exact tag (clean vX.Y.Z) or a dev-build
+          # (any commit between tags). Show -dev for the latter so the tag
+          # number isn't mistaken for a final release.
+          vnum="${{ needs.check-upstream.outputs.version }}"
+          if [ -n "${vnum}" ]; then
+            # Does this sha match an upstream git tag (v<version>)?
+            # /git/refs/tags/{tag} returns the object the tag points at --
+            # an annotated tag object (type=tag, needs deref) or, for a
+            # lightweight tag, the commit object itself (type=commit).
+            commit_of_tag=""
+            vref=$(GH_TOKEN="$GH_TOKEN" gh api \
+              "repos/ggml-org/whisper.cpp/git/refs/tags/v${vnum}" 2>/dev/null || echo "")
+            if [ -n "${vref}" ]; then
+              obj_type=$(printf '%s' "${vref}" | jq -r '.object.type' 2>/dev/null || echo "")
+              obj_sha=$(printf '%s' "${vref}" | jq -r '.object.sha' 2>/dev/null || echo "")
+              if [ "${obj_type}" = "tag" ]; then
+                commit_of_tag=$(GH_TOKEN="$GH_TOKEN" gh api \
+                  "repos/ggml-org/whisper.cpp/git/tags/${obj_sha}" --jq '.object.sha' 2>/dev/null || echo "")
+              else
+                commit_of_tag="${obj_sha}"
+              fi
+            fi
+            if [ "${commit_of_tag:-}" = "${sha}" ]; then
+              ver_display="v${vnum}"
+            else
+              ver_display="v${vnum}-dev"
+            fi
+          else
+            ver_display="v${short}"   # fallback: sha-based version
+            echo "WARN: upstream version unresolved; using sha for tag/asset naming"
+          fi
+
+          tag="whisper-${ver_display}"
           # idempotent: a prior run (force) may have already created this tag
           gh api -X DELETE "repos/${{ github.repository }}/releases/tags/${tag}" >/dev/null 2>&1 || true
 
-          # QUOTED heredoc delimiter (<<'BODY'): the body contains backticks
-          # (inline code) and must be written verbatim -- unquoted <<BODY runs
-          # them as command substitution. ${sha} is a real shell var, set above.
-          cat > release-body.md <<'BODY'
-          Auto-built from `ggml-org/whisper.cpp` at commit `${sha}` (CUDA 12.9, sm_75 / Turing).
-
+          # --- Write the release notes --------------------------------------
+          # Version/SHA are embedded as markdown inline code. In bash double-
+          # quotes, backtick escapes (\`) are literal and ${var} expands --
+          # exactly what we want (opposite of a single-quoted heredoc where
+          # ${var} stays literal, which was the old bug at line 353).
+          TOP_LINE="whisper-cli from \`ggml-org/whisper.cpp\` -- version \`${ver_display}\`"
+          SHA_LINE="Upstream commit: \`${sha}\` . Build: Windows 10 / CUDA 12.9 / Turing sm_75."
+          {
+            printf '%s\n' "$TOP_LINE"
+            printf '\n'
+            printf '%s\n' "$SHA_LINE"
+            printf '\n'
+            cat <<'BODY'
           ## Windows host requirements
           - NVIDIA GPU driver installed (provides `nvcuda.dll`).
           - cuBLAS 12.x resolvable. Two zips:
@@ -339,6 +414,7 @@ jobs:
           whisper.bat -m yourmodel.bin -f audio.wav -l en
           ```
           BODY
+          } > release-body.md
 
           # Create the release via REST (no local git / tag-pushing; the runner
           # isn't a checkout target for that). target_commitish is omitted on
@@ -347,7 +423,7 @@ jobs:
           release_id=$(GH_TOKEN="$GH_TOKEN" gh api \
             -X POST "repos/${{ github.repository }}/releases" \
             -f "tag_name=${tag}" \
-            -f "name=whisper-cli CUDA 12.9 (Turing sm_75) -- ${short}" \
+            -f "name=whisper-cli CUDA 12.9 (Turing sm_75) -- ${ver_display}" \
             -F "body=@release-body.md" \
             --jq '.id')
 
