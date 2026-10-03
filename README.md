@@ -11,13 +11,21 @@ the pipeline fresh (no GitHub inactivity timeout) and is the next poll's "alread
 done" marker. A failed build or test publishes nothing — the last passing release
 stays.
 
-Each release is named **`whisper-v<version>`** where the version is parsed from
-upstream `CMakeLists.txt` (e.g. `v1.9.4`). If the commit is between upstream tags
-(a dev build), the tag/notes read **`v<version>-dev`** so the number isn't mistaken
-for the tagged release. Asset *filenames* use the 12-char SHA — unchanged since
-the build step names the zips before the release step resolves the label.
+Each release is named after the **upstream version** parsed from whisper.cpp's
+`CMakeLists.txt` (e.g. **1.9.4**). If the commit is exactly the upstream `vX.Y.Z`
+tag, the version is clean; if it's a master commit between tags (a dev build), a
+`-dev` suffix is added (e.g. `1.9.4-dev`) so the number isn't mistaken for the
+tagged release. The full upstream SHA is always recorded in the release notes.
 
-Grab the latest build from **Releases** → `whisper-cli-win-cuda12.9-<sha>.zip`.
+- Release **tag**: `whisper-<version>` (e.g. `whisper-1.9.4-dev`)
+- Release **title**: `whisper-cli <version>`
+- **Assets** (zips): `whisper-cli-<version>-win-cuda12.9.zip` (slim) and
+  `whisper-cli-<version>-win-cuda12.9-cublas.zip` (portable, bundles cuBLAS)
+
+If the version ever can't be resolved (upstream layout change), naming falls back
+to the 12-char SHA with a CI warning — the build still publishes.
+
+Grab the latest build from **Releases** → `whisper-cli-<version>-win-cuda12.9.zip`.
 
 ## What's in it
 

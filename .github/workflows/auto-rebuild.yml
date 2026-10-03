@@ -11,10 +11,12 @@
 # launching it there would die with 0xC0000135 (STATUS_DLL_NOT_FOUND) at load.
 #
 # Published (only on pass):
-#   GitHub Release whisper-v<ver>  (e.g. whisper-v1.9.4, or whisper-v1.9.4-dev
-#   if the commit is between tags; version parsed from upstream CMakeLists.txt):
-#     whisper-cli-win-cuda12.9-<sha12>.zip         (slim: system CUDA 12.9 cuBLAS)
-#     whisper-cli-win-cuda12.9-<sha12>-cublas.zip  (portable: bundles cuBLAS)
+#   GitHub Release tag `whisper-<version>` (e.g. whisper-1.9.4, or
+#   whisper-1.9.4-dev when the commit is between upstream tags; the version
+#   is parsed from upstream CMakeLists.txt and the full SHA is recorded in
+#   the release notes):
+#     whisper-cli-<version>-win-cuda12.9.zip         (slim: system CUDA 12.9 cuBLAS)
+#     whisper-cli-<version>-win-cuda12.9-cublas.zip  (portable: bundles cuBLAS)
 #
 # State: `upstream-sha` in the repo root = last published upstream SHA.
 #
@@ -58,6 +60,7 @@ jobs:
       build_sha: ${{ steps.check.outputs.build_sha }}
       changed: ${{ steps.check.outputs.changed }}
       version: ${{ steps.version.outputs.version }}
+      version_label: ${{ steps.version.outputs.version_label }}
     steps:
       - uses: actions/checkout@v6
 
@@ -98,18 +101,23 @@ jobs:
 
       - name: Resolve upstream version (human-readable) for release naming
         id: version
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           # whisper.cpp keeps its SemVer in CMakeLists.txt as three variables
-          # (WHISPER_VERSION_MAJOR / MINOR / PATCH). A tag (vX.Y.Z) is NOT a
+          # (WHISPER_VERSION_MAJOR / MINOR / PATCH). A git tag (vX.Y.Z) is NOT a
           # separate version file, so parse the CMake values at the target SHA.
+          # The label used everywhere downstream (tag, title, asset filenames):
+          #   "<X.Y.Z>"       when the commit is exactly the upstream vX.Y.Z tag
+          #   "<X.Y.Z>-dev"   when it is a master commit between tags
+          #   "<sha12>"       fallback if the version cannot be resolved
           sha="${{ steps.check.outputs.build_sha }}"
           v=""
           if [ -n "$sha" ]; then
             cm=$(curl -fsSL \
-                  -H "Authorization: Bearer ${GITHUB_TOKEN:-}" \
+                  -H "Authorization: Bearer ***" \
                   "https://raw.githubusercontent.com/ggml-org/whisper.cpp/${sha}/CMakeLists.txt" || echo "")
-            # Only resolve when building (changed=true); a no-op run has empty sha.
             maj=$(printf '%s\n' "$cm" | sed -nE 's/^set\(WHISPER_VERSION_MAJOR ([0-9]+).*/\1/p' | head -1)
             min=$(printf '%s\n' "$cm" | sed -nE 's/^set\(WHISPER_VERSION_MINOR ([0-9]+).*/\1/p' | head -1)
             pat=$(printf '%s\n' "$cm" | sed -nE 's/^set\(WHISPER_VERSION_PATCH ([0-9]+).*/\1/p' | head -1)
@@ -117,14 +125,37 @@ jobs:
               v="${maj}.${min}.${pat}"
             fi
           fi
+
+          label=""
           if [ -n "$v" ]; then
-            echo "version=$v" >> "$GITHUB_OUTPUT"
-            echo "Upstream version: $v (sha=${sha:0:12})"
-          else
-            echo "version= (unresolved -- release will use bare sha)" >> "$GITHUB_OUTPUT"
+            # Does this sha match an upstream git tag (v<version>)?
+            # /git/refs/tags/{tag} returns the object the tag points at --
+            # an annotated tag object (type=tag, needs deref) or, for a
+            # lightweight tag, the commit object itself (type=commit).
+            commit_of_tag=""
+            vref=$(gh api "repos/ggml-org/whisper.cpp/git/refs/tags/v${v}" 2>/dev/null || echo "")
+            if [ -n "${vref}" ]; then
+              obj_type=$(printf '%s' "${vref}" | jq -r '.object.type' 2>/dev/null || echo "")
+              obj_sha=$(printf '%s' "${vref}" | jq -r '.object.sha' 2>/dev/null || echo "")
+              if [ "${obj_type}" = "tag" ]; then
+                commit_of_tag=$(gh api "repos/ggml-org/whisper.cpp/git/tags/${obj_sha}" --jq '.object.sha' 2>/dev/null || echo "")
+              else
+                commit_of_tag="${obj_sha}"
+              fi
+            fi
+            if [ -n "$sha" ] && [ "${commit_of_tag:-}" = "${sha}" ]; then
+              label="${v}"
+            else
+              label="${v}-dev"
+            fi
           fi
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          if [ -z "$label" ]; then
+            label="${sha:0:12}"
+            echo "WARN: upstream version unresolved; using bare sha for naming"
+          fi
+          echo "version=${v}" >> "$GITHUB_OUTPUT"
+          echo "version_label=${label}" >> "$GITHUB_OUTPUT"
+          echo "Resolved label: ${label} (version=${v:-<none>}, sha=${sha:0:12})"
 
   build-windows:
     needs: check-upstream
@@ -136,6 +167,7 @@ jobs:
     timeout-minutes: 180
     env:
       UPSTREAM_SHA: ${{ needs.check-upstream.outputs.build_sha }}
+      UPSTREAM_VERSION_LABEL: ${{ needs.check-upstream.outputs.version_label }}
       CUDA_VER: '12.9.0'
     steps:
       - uses: actions/checkout@v6
@@ -231,7 +263,8 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $sha = ($env:UPSTREAM_SHA).Substring(0,12)
+          $label = $env:UPSTREAM_VERSION_LABEL
+          if (-not $label) { $label = ($env:UPSTREAM_SHA).Substring(0,12) }
           New-Item -ItemType Directory -Force -Path dist\slim | Out-Null
 
           # Copy the built exe + every DLL the build produced in bin\. With --target
@@ -263,7 +296,7 @@ jobs:
           ), [Text.Encoding]::ASCII)
 
           # Slim zip: exe + ggml/whisper DLLs + launcher. cuBLAS comes from system CUDA 12.9.
-          Compress-Archive -Path dist\slim\* -DestinationPath "whisper-cli-win-cuda12.9-$sha.zip" -Force
+          Compress-Archive -Path dist\slim\* -DestinationPath "whisper-cli-$label-win-cuda12.9.zip" -Force
 
           # Portable zip: same, but bundle cuBLAS from the toolkit's bin for CUDA-less machines.
           New-Item -ItemType Directory -Force -Path dist\full | Out-Null
@@ -271,9 +304,9 @@ jobs:
           Get-ChildItem "$env:CUDA_PATH\bin" -Filter 'cublas*.dll' | ForEach-Object {
             Copy-Item $_.FullName dist\full\ -Force
           }
-          Compress-Archive -Path dist\full\* -DestinationPath "whisper-cli-win-cuda12.9-$sha-cublas.zip" -Force
+          Compress-Archive -Path dist\full\* -DestinationPath "whisper-cli-$label-win-cuda12.9-cublas.zip" -Force
 
-          Write-Host "=== release zips ==="
+          Write-Host "=== release zips (label=$label) ==="
           Get-ChildItem "$PWD" -Filter 'whisper-cli-*.zip' | ForEach-Object {
             Write-Host ("  {0,10:N0} KB  {1}" -f ($_.Length/1024), $_.Name)
           }
@@ -284,7 +317,7 @@ jobs:
         with:
           name: whisper-cuda-win-${{ env.UPSTREAM_SHA }}
           path: |
-            whisper-cli-win-cuda12.9-*.zip
+            whisper-cli-*.zip
             build-cuda.log
             build-cpu.log
             transcribe.log
@@ -313,46 +346,20 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           BUILD_SHA: ${{ needs.check-upstream.outputs.build_sha }}
-          UPSTREAM_VERSION: ${{ needs.check-upstream.outputs.version }}
+          VERSION_LABEL: ${{ needs.check-upstream.outputs.version_label }}
         run: |
           set -euo pipefail
           sha="${{ needs.check-upstream.outputs.build_sha }}"
-          short="${sha:0:12}"
 
-          # --- Build a human-readable version string -------------------------
-          # The commit might be an exact tag (clean vX.Y.Z) or a dev-build
-          # (any commit between tags). Show -dev for the latter so the tag
-          # number isn't mistaken for a final release.
-          vnum="${{ needs.check-upstream.outputs.version }}"
-          if [ -n "${vnum}" ]; then
-            # Does this sha match an upstream git tag (v<version>)?
-            # /git/refs/tags/{tag} returns the object the tag points at --
-            # an annotated tag object (type=tag, needs deref) or, for a
-            # lightweight tag, the commit object itself (type=commit).
-            commit_of_tag=""
-            vref=$(GH_TOKEN="$GH_TOKEN" gh api \
-              "repos/ggml-org/whisper.cpp/git/refs/tags/v${vnum}" 2>/dev/null || echo "")
-            if [ -n "${vref}" ]; then
-              obj_type=$(printf '%s' "${vref}" | jq -r '.object.type' 2>/dev/null || echo "")
-              obj_sha=$(printf '%s' "${vref}" | jq -r '.object.sha' 2>/dev/null || echo "")
-              if [ "${obj_type}" = "tag" ]; then
-                commit_of_tag=$(GH_TOKEN="$GH_TOKEN" gh api \
-                  "repos/ggml-org/whisper.cpp/git/tags/${obj_sha}" --jq '.object.sha' 2>/dev/null || echo "")
-              else
-                commit_of_tag="${obj_sha}"
-              fi
-            fi
-            if [ "${commit_of_tag:-}" = "${sha}" ]; then
-              ver_display="v${vnum}"
-            else
-              ver_display="v${vnum}-dev"
-            fi
-          else
-            ver_display="v${short}"   # fallback: sha-based version
-            echo "WARN: upstream version unresolved; using sha for tag/asset naming"
-          fi
+          # version_label is computed once in check-upstream (resolves the
+          # upstream CMakeLists version and the exact-tag vs -dev state) and
+          # is also used by build-windows to name the zips, so this step just
+          # consumes it. Fallback to the 12-char sha if it ever came through
+          # empty (e.g. version unresolvable).
+          label="${VERSION_LABEL}"
+          [ -n "${label}" ] || label="${sha:0:12}"
 
-          tag="whisper-${ver_display}"
+          tag="whisper-${label}"
           # idempotent: a prior run (force) may have already created this tag
           gh api -X DELETE "repos/${{ github.repository }}/releases/tags/${tag}" >/dev/null 2>&1 || true
 
@@ -361,8 +368,8 @@ jobs:
           # quotes, backtick escapes (\`) are literal and ${var} expands --
           # exactly what we want (opposite of a single-quoted heredoc where
           # ${var} stays literal, which was the old bug at line 353).
-          TOP_LINE="whisper-cli from \`ggml-org/whisper.cpp\` -- version \`${ver_display}\`"
-          SHA_LINE="Upstream commit: \`${sha}\` . Build: Windows 10 / CUDA 12.9 / Turing sm_75."
+          TOP_LINE="whisper-cli \`${label}\` from \`ggml-org/whisper.cpp\` -- Windows 10 / CUDA 12.9 / Turing sm_75."
+          SHA_LINE="Upstream commit: \`${sha}\`."
           {
             printf '%s\n' "$TOP_LINE"
             printf '\n'
@@ -423,13 +430,13 @@ jobs:
           release_id=$(GH_TOKEN="$GH_TOKEN" gh api \
             -X POST "repos/${{ github.repository }}/releases" \
             -f "tag_name=${tag}" \
-            -f "name=whisper-cli CUDA 12.9 (Turing sm_75) -- ${ver_display}" \
+            -f "name=whisper-cli ${label}" \
             -F "body=@release-body.md" \
             --jq '.id')
 
           GH_TOKEN="$GH_TOKEN" gh release upload "${tag}" \
-            "artifacts/whisper-cli-win-cuda12.9-${short}.zip" \
-            "artifacts/whisper-cli-win-cuda12.9-${short}-cublas.zip" --clobber
+            "artifacts/whisper-cli-${label}-win-cuda12.9.zip" \
+            "artifacts/whisper-cli-${label}-win-cuda12.9-cublas.zip" --clobber
 
   commit-sha:
     # Self-commit the newly published upstream SHA back to this repo. This push is the
