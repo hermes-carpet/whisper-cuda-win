@@ -1,37 +1,45 @@
-# Auto-build whisper.cpp (whisper-cli) as a Windows CUDA 12.9 / Turing (sm_75)
-# package whenever upstream ggml-org/whisper.cpp (master) moves -- and only
-# publish a GitHub Release if the build passes BOTH:
-#   1. executable smoke test: a CPU-only build of the same commit transcribes
-#      samples/jfk.wav correctly (proves sources + toolchain are coherent);
-#   2. structural verification of the CUDA build: complete artifacts, static
-#      cudart (no cudart64_12.dll import), cuBLAS DLL, driver import, sm_75 SASS.
+# Auto-build whisper.cpp (whisper-cli) for a set of GPU/CUDA configs on Windows,
+# and publish ONE GitHub Release (tagged by the upstream version label) containing
+# one pair of zips per config, whenever upstream ggml-org/whisper.cpp (master) moves.
 #
-# The CUDA binary itself CANNOT be executed on a hosted runner: ggml-cuda.dll
-# imports nvcuda.dll (the NVIDIA driver, which only the target machine has), so
-# launching it there would die with 0xC0000135 (STATUS_DLL_NOT_FOUND) at load.
+# A "config" = one row of the build-windows matrix. To support a new GPU/CUDA combo,
+# add one row there -- everything (naming, launcher env var, zip suffix, artifact
+# name, release file listing) is derived from that row, so a new future config is a
+# one-line addition. The two configs today:
 #
-# Published (only on pass):
-#   GitHub Release tag `whisper-<version>` (e.g. whisper-1.9.4, or
-#   whisper-1.9.4-dev when the commit is between upstream tags; the version
-#   is parsed from upstream CMakeLists.txt and the full SHA is recorded in
-#   the release notes):
-#     whisper-cli-<version>-win-cuda12.9.zip         (slim: system CUDA 12.9 cuBLAS)
-#     whisper-cli-<version>-win-cuda12.9-cublas.zip  (portable: bundles cuBLAS)
+#   turing-cuda12.9 : RTX 2060/2070/2080 / Titan Xp (Turing sm_75), CUDA 12.9
+#   ada-cuda13.4    : RTX 4060 (Ada sm_89), host CUDA 13.4
 #
-# State: `upstream-sha` in the repo root = last published upstream SHA.
+# CUDA binary CANNOT be executed on a hosted runner: ggml-cuda.dll imports
+# nvcuda.dll (the NVIDIA driver, only on the target machine) -> 0xC0000135 at load.
+# So each CUDA build is verified STRUCTURALLY (complete artifacts, static cudart,
+# cuBLAS DLL import, driver import, single-arch SASS via cuobjdump), while a separate
+# CPU-only build of the same commit runs a real jfk.wav transcription as the
+# executable smoke test (run once, config-independent).
 #
-# This mirrors hermes-carpet/llama-slim: a weekly cron (Tue 09:00 UTC) polls
-# ggml-org/whisper.cpp master and a successful poll self-commits the new
-# upstream SHA back to this repo (keepalive / no GitHub inactivity timeout).
-# A failed build/test publishes nothing and leaves the last passing release.
+# Per-config published zips (only on pass):
+#   whisper-cli-<label>-win-cuda<HOST_CUDA>.zip          (slim: system cuBLAS)
+#   whisper-cli-<label>-win-cuda<HOST_CUDA>-cublas.zip   (portable: bundles cuBLAS)
+# where <label> is the upstream version label (e.g. 1.9.4 or 1.9.4-dev) and the
+# release tag is whisper-<label>.
+#
+# Note on the 4060 CUDA: it targets host CUDA 13.4 (whisper.bat resolves
+# %CUDA_PATH_V13_4%). CI builds it with the newest CUDA-13 Windows installer that is
+# publicly resolvable (13.3.1 today) because 13.4 has no Windows installer on
+# NVIDIA's CDN yet; a 13.3.1-built binary links cublas64_13.dll and runs on any
+# CUDA 13.x host including 13.4. Flip matrix.build_cuda to a 13.4.x once that
+# installer exists -- the zip name (cuda13.4) and the host env var stay put.
+#
+# State: `upstream-sha` (repo root) = last published upstream SHA. The commit-sha
+# job self-commits it back -- the llama-slim keepalive pattern.
+# Cadence: weekly (Tue 09:00 UTC) poll + manual workflow_dispatch.
 
 name: auto-rebuild-on-upstream
 
 on:
   schedule:
-    # Weekly, Tuesday 09:00 UTC: poll ggml-org/whisper.cpp master for
-    # commits newer than upstream-sha; if none, exits fast with no build.
-    # Matches hermes-carpet/llama-slim cadence (0 9 * * 2).
+    # Weekly, Tuesday 09:00 UTC: poll ggml-org/whisper.cpp master for commits
+    # newer than upstream-sha; if none, exits fast with no build.
     - cron: '0 9 * * 2'
   workflow_dispatch:
     inputs:
@@ -53,7 +61,13 @@ concurrency:
   group: auto-rebuild-whisper-cuda
   cancel-in-progress: false
 
+defaults:
+  run:
+    shell: bash
+
 jobs:
+  # check-upstream: config-independent. Resolves upstream head, decides whether to
+  # rebuild, and computes the human-readable version label used for naming.
   check-upstream:
     runs-on: ubuntu-24.04
     outputs:
@@ -71,7 +85,7 @@ jobs:
         run: |
           set -euo pipefail
           sha=$(curl -fsSL \
-                  -H "Authorization: Bearer ${GH_TOKEN}" \
+                  -H "Authorization: Bearer ***" \
                   -H "Accept: application/vnd.github+json" \
                   -H "User-Agent: hermes-carpet-whisper-cuda-ci" \
                   https://api.github.com/repos/ggml-org/whisper.cpp/commits/master \
@@ -105,34 +119,27 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          # whisper.cpp keeps its SemVer in CMakeLists.txt as three variables
-          # (WHISPER_VERSION_MAJOR / MINOR / PATCH). A git tag (vX.Y.Z) is NOT a
-          # separate version file, so parse the CMake values at the target SHA.
-          # The label used everywhere downstream (tag, title, asset filenames):
-          #   "<X.Y.Z>"       when the commit is exactly the upstream vX.Y.Z tag
-          #   "<X.Y.Z>-dev"   when it is a master commit between tags
-          #   "<sha12>"       fallback if the version cannot be resolved
+          # whisper.cpp keeps its SemVer in CMakeLists.txt (WHISPER_VERSION_MAJOR
+          # / MINOR / PATCH). Label used for the tag/title/asset filenames:
+          #   "<X.Y.Z>"     when the commit is exactly the upstream vX.Y.Z tag
+          #   "<X.Y.Z>-dev" when it is a master commit between tags
+          #   "<sha12>"     fallback if the version cannot be resolved
           sha="${{ steps.check.outputs.build_sha }}"
           v=""
           if [ -n "$sha" ]; then
-            # raw.githubusercontent.com is PUBLIC -- no token needed (a bearer
-            # token on this host is unnecessary and can even fail). Fetch plain.
+            # raw.githubusercontent.com is PUBLIC -- no token needed.
             cm=$(curl -fsSL \
                   "https://raw.githubusercontent.com/ggml-org/whisper.cpp/${sha}/CMakeLists.txt" || echo "")
             maj=$(printf '%s\n' "$cm" | sed -nE 's/^set\(WHISPER_VERSION_MAJOR ([0-9]+).*/\1/p' | head -1)
             min=$(printf '%s\n' "$cm" | sed -nE 's/^set\(WHISPER_VERSION_MINOR ([0-9]+).*/\1/p' | head -1)
             pat=$(printf '%s\n' "$cm" | sed -nE 's/^set\(WHISPER_VERSION_PATCH ([0-9]+).*/\1/p' | head -1)
-            if [ -n "${maj}${min}${pat}" ]; then
-              v="${maj}.${min}.${pat}"
-            fi
+            if [ -n "${maj}${min}${pat}" ]; then v="${maj}.${min}.${pat}"; fi
           fi
 
           label=""
           if [ -n "$v" ]; then
-            # Does this sha match an upstream git tag (v<version>)?
-            # /git/refs/tags/{tag} returns the object the tag points at --
-            # an annotated tag object (type=tag, needs deref) or, for a
-            # lightweight tag, the commit object itself (type=commit).
+            # Does this sha match an upstream git tag (v<version>)? A tag may be
+            # annotated (needs deref) or lightweight (points straight at commit).
             commit_of_tag=""
             vref=$(gh api "repos/ggml-org/whisper.cpp/git/refs/tags/v${v}" 2>/dev/null || echo "")
             if [ -n "${vref}" ]; then
@@ -144,11 +151,7 @@ jobs:
                 commit_of_tag="${obj_sha}"
               fi
             fi
-            if [ -n "$sha" ] && [ "${commit_of_tag:-}" = "${sha}" ]; then
-              label="${v}"
-            else
-              label="${v}-dev"
-            fi
+            if [ -n "${sha}" ] && [ "${commit_of_tag:-}" = "${sha}" ]; then label="${v}"; else label="${v}-dev"; fi
           fi
           if [ -z "$label" ]; then
             label="${sha:0:12}"
@@ -158,18 +161,16 @@ jobs:
           echo "version_label=${label}" >> "$GITHUB_OUTPUT"
           echo "Resolved label: ${label} (version=${v:-<none>}, sha=${sha:0:12})"
 
-  build-windows:
+  # build-cpu: CPU-only build of the same commit + real jfk.wav transcription.
+  # Runs ONCE (config-independent) -- the executable smoke test proving the sources
+  # + toolchain are coherent before we trust the CUDA builds.
+  build-cpu:
     needs: check-upstream
     if: needs.check-upstream.outputs.changed == 'true'
-    # PINNED: windows-latest rotated to the "windows-2025-vs2026" image (VS 2026
-    # only, no VS 2022) on 2026-09-25. nvcc 12.9 only supports VS 2017..2022,
-    # so the build must run on an image that still ships VS 2022.
     runs-on: windows-2022
-    timeout-minutes: 180
+    timeout-minutes: 60
     env:
       UPSTREAM_SHA: ${{ needs.check-upstream.outputs.build_sha }}
-      UPSTREAM_VERSION_LABEL: ${{ needs.check-upstream.outputs.version_label }}
-      CUDA_VER: '12.9.0'
     steps:
       - uses: actions/checkout@v6
 
@@ -184,20 +185,136 @@ jobs:
           git fetch -q --depth 1 origin $env:UPSTREAM_SHA
           git checkout -q FETCH_HEAD
           Write-Host "checked out $(git rev-parse HEAD)"
-          # ggml is vendored as a plain directory (no .gitmodules) -- nothing to recurse.
           Pop-Location
 
-      - name: Install CUDA Toolkit 12.9.0
+      - name: Build CPU whisper-cli (no CUDA)
+        shell: cmd
+        run: |
+          scripts\build-whisper-cuda.cmd CPU > build-cpu.log 2>&1
+          if errorlevel 1 (
+            echo "=== CPU build FAILED: last 60 lines of build-cpu.log ==="
+            powershell -NoProfile -Command "Get-Content build-cpu.log -Tail 60"
+            exit /b 1
+          )
+          powershell -NoProfile -Command "Get-Content build-cpu.log -Tail 20"
+
+      - name: CPU smoke test (transcribe jfk.wav with the CPU build)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $exe = "$PWD\build-cpu\bin\whisper-cli.exe"
+          if (-not (Test-Path $exe)) { throw "CPU whisper-cli.exe missing at $exe" }
+          $wav = "$PWD\upstream\samples\jfk.wav"
+          if (-not (Test-Path $wav)) { throw "jfk.wav not found at $wav" }
+          New-Item -ItemType Directory -Force -Path model | Out-Null
+          $model = "$PWD\model\ggml-tiny.en.bin"
+          if (-not (Test-Path $model)) {
+            Write-Host "Downloading ggml-tiny.en.bin..."
+            Invoke-WebRequest "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.en.bin" -OutFile $model -UseBasicParsing
+          }
+          Write-Host ("model size: {0:N0} bytes" -f (Get-Item $model).Length)
+          Write-Host "Running: $exe -m $model -f $wav -l en -nt"
+          & $exe -m $model -f $wav -l en -nt > transcribe.log 2>&1
+          $code = $LASTEXITCODE
+          Write-Host "---- transcribe.log ----"
+          Get-Content transcribe.log
+          if ($code -ne 0) { throw "whisper-cli exited $code on CPU smoke test (see transcribe.log)" }
+          $txt = Get-Content transcribe.log -Raw
+          if ($txt -notmatch 'that is|country|american|fellow|ask not|your|that no') {
+            Write-Host "WARN: transcript did not match expected JFK keywords: $txt"
+          }
+          "CPU smoke test PASSED" | Out-File -FilePath cpu-pass.txt -Encoding ascii
+          Write-Host "CPU smoke test PASSED"
+
+      - name: Upload CPU pass marker + logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cpu-pass
+          path: |
+            cpu-pass.txt
+            build-cpu.log
+            transcribe.log
+          retention-days: 14
+          if-no-files-found: warn
+
+  # build-windows (matrix): one leg per GPU/CUDA config. Each leg installs its build
+  # CUDA toolkit, builds the single-arch CUDA whisper-cli, structurally verifies it,
+  # and packages its two zips (slim + cublas-bundled) named per config.
+  build-windows:
+    needs: check-upstream
+    if: needs.check-upstream.outputs.changed == 'true'
+    # windows-2022 is PINNED: windows-latest rotated to the VS 2026-only
+    # "windows-2025-vs2026" image (no VS 2022) on 2026-09-25. CUDA 12.x and 13.x
+    # both support VS 2022 (13.0 only dropped VS 2017; 13.2 added VS 2026 as an
+    # extra), so both configs build here. A config can override runs-on + VS_HINT
+    # if a future CUDA ever drops VS 2022.
+    runs-on: windows-2022
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # RTX 2060/2070/2080 / Titan Xp : Turing sm_75, CUDA 12.9.
+          - cfg: turing-cuda12.9
+            arch: 75
+            build_cuda: '12.9.0'       # CUDA toolkit version CI installs
+            dll_major: '12'            # cublas64_12.dll / cudart64_12.dll
+            host_cuda: '12.9'          # zip suffix + host env major.minor
+            host_env_var: 'CUDA_PATH_V12_9'
+            gpu: 'RTX 2060 / 2070 / 2080 / Titan Xp (Turing sm_75)'
+            arch_short: 'Turing sm_75'
+          # RTX 4060 : Ada sm_89, host CUDA 13.4.
+          # Built in CI with CUDA 13.3.1 (newest publicly-resolvable 13.x Windows
+          # installer); runs on any CUDA 13.x host incl. the 4060's CUDA 13.4.
+          # Flip build_cuda to a 13.4.x once NVIDIA ships a Windows 13.4 installer;
+          # host_cuda / host_env_var / the cuda13.4 zip name stay unchanged.
+          - cfg: ada-cuda13.4
+            arch: 89
+            build_cuda: '13.3.1'
+            dll_major: '13'
+            host_cuda: '13.4'
+            host_env_var: 'CUDA_PATH_V13_4'
+            gpu: 'RTX 4060 (Ada sm_89)'
+            arch_short: 'Ada sm_89'
+    env:
+      CFG: ${{ matrix.cfg }}
+      UPSTREAM_SHA: ${{ needs.check-upstream.outputs.build_sha }}
+      UPSTREAM_VERSION_LABEL: ${{ needs.check-upstream.outputs.version_label }}
+      CUDA_ARCH: ${{ matrix.arch }}
+      CUDA_MAJOR: ${{ matrix.dll_major }}
+      CUDA_BUILD_VER: ${{ matrix.build_cuda }}
+      HOST_CUDA: ${{ matrix.host_cuda }}
+      HOST_ENV: ${{ matrix.host_env_var }}
+      HOST_GPU: ${{ matrix.gpu }}
+      HOST_ARCH_SHORT: ${{ matrix.arch_short }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Fetch upstream whisper.cpp at candidate SHA (ggml vendored, no submodules)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path upstream | Out-Null
+          Push-Location upstream
+          git init -q
+          git remote add origin https://github.com/ggml-org/whisper.cpp
+          git fetch -q --depth 1 origin $env:UPSTREAM_SHA
+          git checkout -q FETCH_HEAD
+          Write-Host "checked out $(git rev-parse HEAD)"
+          Pop-Location
+
+      - name: Install CUDA Toolkit ${{ matrix.build_cuda }} (config ${{ matrix.cfg }})
         uses: Jimver/cuda-toolkit@v0.2.36
         id: cuda
         with:
-          cuda: ${{ env.CUDA_VER }}
+          cuda: ${{ matrix.build_cuda }}
           method: 'network'
 
       - name: Install Ninja
         uses: seanmiddleditch/gha-setup-ninja@v5
 
-      - name: Build CUDA whisper-cli (sm_75 / Turing, CUDA 12.9)
+      - name: Build CUDA whisper-cli (${{ matrix.arch_short }})
         shell: cmd
         run: |
           scripts\build-whisper-cuda.cmd CUDA > build-cuda.log 2>&1
@@ -212,138 +329,99 @@ jobs:
       - name: Verify CUDA build (structural - no GPU on this runner)
         shell: pwsh
         run: |
-          # The CUDA binary cannot be executed here (no NVIDIA driver => 0xC0000135).
-          # Verify the artifacts instead: completeness, static cudart, DLL cuBLAS,
-          # driver import present, sm_75 SASS embedded, single-arch size.
           $env:PATH = "$env:CUDA_PATH\bin;" + $env:PATH
           . "$PWD\scripts\verify-cuda.ps1"
 
-      - name: Build CPU whisper-cli (no CUDA - for the executable smoke test)
-        shell: cmd
-        run: |
-          scripts\build-whisper-cuda.cmd CPU > build-cpu.log 2>&1
-          if errorlevel 1 (
-            echo "=== CPU build FAILED: last 60 lines of build-cpu.log ==="
-            powershell -NoProfile -Command "Get-Content build-cpu.log -Tail 60"
-            exit /b 1
-          )
-          echo "=== CPU build OK: last 20 lines of build-cpu.log ==="
-          powershell -NoProfile -Command "Get-Content build-cpu.log -Tail 20"
-
-      - name: CPU smoke test (transcribe jfk.wav with the CPU build)
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Continue'
-          $exe = "$PWD\build-cpu\bin\whisper-cli.exe"
-          if (-not (Test-Path $exe)) { throw "CPU whisper-cli.exe missing at $exe" }
-
-          $wav = "$PWD\upstream\samples\jfk.wav"
-          if (-not (Test-Path $wav)) { throw "jfk.wav not found at $wav" }
-
-          New-Item -ItemType Directory -Force -Path model | Out-Null
-          $model = "$PWD\model\ggml-tiny.en.bin"
-          if (-not (Test-Path $model)) {
-            Write-Host "Downloading ggml-tiny.en.bin..."
-            Invoke-WebRequest "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.en.bin" -OutFile $model -UseBasicParsing
-          }
-          Write-Host ("model size: {0:N0} bytes" -f (Get-Item $model).Length)
-
-          Write-Host "Running: $exe -m $model -f $wav -l en -nt"
-          & $exe -m $model -f $wav -l en -nt > transcribe.log 2>&1
-          $code = $LASTEXITCODE
-          Write-Host "---- transcribe.log ----"
-          Get-Content transcribe.log
-          if ($code -ne 0) { throw "whisper-cli exited $code on CPU smoke test (see transcribe.log)" }
-          $txt = Get-Content transcribe.log -Raw
-          if ($txt -notmatch 'that is|country|american|fellow|ask not|your|that no') {
-            Write-Host "WARN: transcript did not match expected JFK keywords: $txt"
-          }
-          Write-Host "CPU smoke test PASSED"
-
-      - name: Package slim (system cuBLAS) + portable (bundled cuBLAS)
+      - name: 'Package slim (system cuBLAS) + portable (bundled cuBLAS) [$HOST_CUDA]'
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $label = $env:UPSTREAM_VERSION_LABEL
+          $label   = $env:UPSTREAM_VERSION_LABEL
           if (-not $label) { $label = ($env:UPSTREAM_SHA).Substring(0,12) }
-          New-Item -ItemType Directory -Force -Path dist\slim | Out-Null
+          $cu      = $env:HOST_CUDA    # e.g. 12.9 / 13.4 -> zip suffix + launcher
+          $envVar  = $env:HOST_ENV     # e.g. CUDA_PATH_V12_9 / CUDA_PATH_V13_4
+          $example = 'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v' + $cu
 
-          # Copy the built exe + every DLL the build produced in bin\. With --target
-          # whisper-cli the set is exactly { whisper-cli.exe whisper.dll ggml.dll
-          # ggml-base.dll ggml-cpu.dll ggml-cuda.dll } -- nothing else is built.
+          New-Item -ItemType Directory -Force -Path dist\slim | Out-Null
           Copy-Item "$PWD\build\bin\whisper-cli.exe" dist\slim\
-          Get-ChildItem "$PWD\build\bin" -Filter '*.dll' | ForEach-Object {
-            Copy-Item $_.FullName dist\slim\
-          }
-          Write-Host "Slim payload:"
+          # With --target whisper-cli the DLL set is exactly { whisper-cli.exe
+          # whisper.dll ggml.dll ggml-base.dll ggml-cpu.dll ggml-cuda.dll }.
+          Get-ChildItem "$PWD\build\bin" -Filter '*.dll' | ForEach-Object { Copy-Item $_.FullName dist\slim\ }
+          Write-Host "Slim payload (config $env:CFG, host CUDA $cu):"
           Get-ChildItem dist\slim | ForEach-Object { Write-Host ("  {0,12:N0}  {1}" -f $_.Length, $_.Name) }
 
-          # Launcher resolves CUDA 12.9 via CUDA_PATH_V12_9 (toolkit-set) over a polluted
-          # PATH, so cuBLAS/cuDART load from the 12.9 install on the target machine.
-          [IO.File]::WriteAllLines("$PWD\dist\slim\whisper.bat", @(
-            '@echo off',
-            'rem whisper-cuda launcher: prefer CUDA 12.9 via CUDA_PATH_V12_9 (toolkit-set)',
-            'rem so cuBLAS/cuDART resolve from the 12.9 install, not from a polluted PATH.',
-            'if "%CUDA_PATH_V12_9%"=="" (',
-            '  echo [whisper-cuda] WARNING: CUDA_PATH_V12_9 is not set on this machine.',
-            '  echo [whisper-cuda]   cuBLAS/cuDART must come from the CUDA 12.9 toolkit.',
-            '  echo [whisper-cuda]   Fix: set CUDA_PATH_V12_9 to your CUDA 12.9 install dir,',
-            '  echo [whisper-cuda]   e.g. C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.9',
-            '  echo [whisper-cuda]   (the CUDA 12.9 toolkit normally sets this) and re-run.',
-            ') else (',
-            '  set "PATH=%CUDA_PATH_V12_9%\bin;%PATH%"',
-            ')',
+          # Build the launcher as an array of SINGLE-quoted strings (no PowerShell
+          # expansion, no double-quote-escaping) with placeholders, then substitute.
+          $launcher = @(
+            '@echo off'
+            'rem whisper-cuda launcher (host CUDA __CU__): prefer __ENVVAR__ (toolkit-set)'
+            'rem so cuBLAS/cuDART resolve from the CUDA __CU__ install, not a polluted PATH.'
+            'if "%__ENVVAR__%"=="" ('
+            '  echo [whisper-cuda] WARNING: __ENVVAR__ is not set on this machine.'
+            '  echo [whisper-cuda]   cuBLAS/cuDART must come from the CUDA __CU__ toolkit.'
+            '  echo [whisper-cuda]   Fix: set __ENVVAR__ to your CUDA __CU__ install dir,'
+            '  echo [whisper-cuda]   e.g. __EXAMPLE__ (the CUDA __CU__ toolkit normally sets this) and re-run.'
+            ') else ('
+            '  set "PATH=%__ENVVAR__%\bin;%PATH%"'
+            ')'
             '"%~dp0whisper-cli.exe" %*'
-          ), [Text.Encoding]::ASCII)
+          )
+          $bat = ($launcher -join "`r`n").Replace('__CU__',$cu).Replace('__ENVVAR__',$envVar).Replace('__EXAMPLE__',$example) + "`r`n"
+          [IO.File]::WriteAllText("$PWD\dist\slim\whisper.bat", $bat, [Text.Encoding]::ASCII)
 
-          # Slim zip: exe + ggml/whisper DLLs + launcher. cuBLAS comes from system CUDA 12.9.
-          Compress-Archive -Path dist\slim\* -DestinationPath "whisper-cli-$label-win-cuda12.9.zip" -Force
-
-          # Portable zip: same, but bundle cuBLAS from the toolkit's bin for CUDA-less machines.
+          # Slim zip: exe + ggml/whisper DLLs + launcher. cuBLAS from system CUDA $cu.
+          Compress-Archive -Path dist\slim\* -DestinationPath "whisper-cli-$label-win-cuda$cu.zip" -Force
+          # Portable zip: same, but bundle cuBLAS (cublas*.dll) from the toolkit bin.
           New-Item -ItemType Directory -Force -Path dist\full | Out-Null
           Copy-Item dist\slim\* dist\full\ -Force
-          Get-ChildItem "$env:CUDA_PATH\bin" -Filter 'cublas*.dll' | ForEach-Object {
-            Copy-Item $_.FullName dist\full\ -Force
-          }
-          Compress-Archive -Path dist\full\* -DestinationPath "whisper-cli-$label-win-cuda12.9-cublas.zip" -Force
+          Get-ChildItem "$env:CUDA_PATH\bin" -Filter 'cublas*.dll' | ForEach-Object { Copy-Item $_.FullName dist\full\ -Force }
+          Compress-Archive -Path dist\full\* -DestinationPath "whisper-cli-$label-win-cuda$cu-cublas.zip" -Force
 
-          Write-Host "=== release zips (label=$label) ==="
+          Write-Host "=== release zips (config $env:CFG, label=$label, cuda$cu) ==="
           Get-ChildItem "$PWD" -Filter 'whisper-cli-*.zip' | ForEach-Object {
             Write-Host ("  {0,10:N0} KB  {1}" -f ($_.Length/1024), $_.Name)
           }
 
-      - name: Upload build logs + artifact
+      - name: 'Upload zips for release (config ${{ matrix.cfg }})'
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: whisper-cuda-win-${{ env.UPSTREAM_SHA }}
+          name: pkg-${{ matrix.cfg }}
           path: |
             whisper-cli-*.zip
+          retention-days: 14
+          if-no-files-found: warn
+
+      - name: 'Upload build logs (config ${{ matrix.cfg }})'
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-${{ matrix.cfg }}
+          path: |
             build-cuda.log
-            build-cpu.log
-            transcribe.log
             sass-targets.txt
           retention-days: 14
           if-no-files-found: warn
 
+  # release: wait for the CPU smoke test + ALL matrix legs to pass, then publish ONE
+  # release (tag whisper-<label>) containing every config's two zips.
   release:
-    needs: [check-upstream, build-windows]
-    if: always() && needs.build-windows.result == 'success'
+    needs: [check-upstream, build-cpu, build-windows]
+    if: always() && needs.build-cpu.result == 'success' && needs.build-windows.result == 'success'
     runs-on: ubuntu-24.04
     permissions:
-      contents: write   # needed by `gh release create`
+      contents: write
     steps:
       - uses: actions/checkout@v6
         with:
-          # fetch this repo's git objects so gh release create can resolve
-          # the target SHA / create+push the tag (it shells out to git).
           fetch-depth: 0
+
       - uses: actions/download-artifact@v4
         with:
-          name: whisper-cuda-win-${{ needs.check-upstream.outputs.build_sha }}
+          pattern: 'pkg-*'
           path: artifacts
 
-      - name: Create GitHub Release (only on pass)
+      - name: Create GitHub Release (only on full pass)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           BUILD_SHA: ${{ needs.check-upstream.outputs.build_sha }}
@@ -351,71 +429,83 @@ jobs:
         run: |
           set -euo pipefail
           sha="${{ needs.check-upstream.outputs.build_sha }}"
-
-          # version_label is computed once in check-upstream (resolves the
-          # upstream CMakeLists version and the exact-tag vs -dev state) and
-          # is also used by build-windows to name the zips, so this step just
-          # consumes it. Fallback to the 12-char sha if it ever came through
-          # empty (e.g. version unresolvable).
           label="${VERSION_LABEL}"
           [ -n "${label}" ] || label="${sha:0:12}"
 
+          # Gather every config's zips. download-artifact with `pattern` nests
+          # each cfg under artifacts/pkg-<cfg>/, so find them recursively.
+          mapfile -t zips < <(find artifacts -name 'whisper-cli-*.zip' 2>/dev/null | sort)
+          if [ "${#zips[@]}" -eq 0 ]; then
+            echo "ERROR: no whisper-cli-*.zip files found in the release artifact."
+            exit 1
+          fi
+
           tag="whisper-${label}"
-          # idempotent: a prior run (force) may have already created this tag
+          # idempotent: a prior (force) run may already have created this tag.
           gh api -X DELETE "repos/${{ github.repository }}/releases/tags/${tag}" >/dev/null 2>&1 || true
 
-          # --- Write the release notes --------------------------------------
-          # Version/SHA are embedded as markdown inline code. In bash double-
-          # quotes, backtick escapes (\`) are literal and ${var} expands --
-          # exactly what we want (opposite of a single-quoted heredoc where
-          # ${var} stays literal, which was the old bug at line 353).
-          TOP_LINE="whisper-cli \`${label}\` from \`ggml-org/whisper.cpp\` -- Windows 10 / CUDA 12.9 / Turing sm_75."
+          # --- Build the release body ----------------------------------------
+          TOP_LINE="whisper-cli \`${label}\` from \`ggml-org/whisper.cpp\` -- Windows 10 GPU builds."
           SHA_LINE="Upstream commit: \`${sha}\`."
+          FILES_SECTION=""
+          for z in "${zips[@]}"; do FILES_SECTION="${FILES_SECTION}  - \`$(basename "$z")\`"$'\n'; done
+
           {
             printf '%s\n' "$TOP_LINE"
             printf '\n'
             printf '%s\n' "$SHA_LINE"
             printf '\n'
+            printf '## Packages (per GPU/CUDA config)\n\n'
+            printf 'Each config ships two zips:\n'
+            printf '  - **slim** (no `-cublas`): relies on your system CUDA toolkit. `whisper.bat`\n'
+            printf '    puts the toolkit bin first on PATH (via the config host env var, e.g.\n'
+            printf '    `%%CUDA_PATH_V12_9%%` / `%%CUDA_PATH_V13_4%%`) so cuBLAS loads from that install.\n'
+            printf '    If the env var is unset it prints exactly what to set and exits.\n'
+            printf '  - **cublas** (`-cublas` suffix): bundles `cublas*.dll` for machines without CUDA.\n'
+            printf '\n'
+            printf '### Files in this release\n\n'
+            printf '%s\n' "$FILES_SECTION"
             cat <<'BODY'
           ## Windows host requirements
-          - NVIDIA GPU driver installed (provides `nvcuda.dll`).
-          - cuBLAS 12.x resolvable. Two zips:
-            - **slim** -- relies on your system CUDA 12.9 toolkit. `whisper.bat`
-              puts `%CUDA_PATH_V12_9%\bin` first on PATH so cuBLAS loads from the
-              12.9 install, not a polluted PATH. If `CUDA_PATH_V12_9` is unset the
-              wrapper prints exactly what to set and exits.
-            - **cublas** -- bundles `cublas*.dll` from the toolkit for machines without CUDA.
+          - An NVIDIA GPU + a relatively recent GPU driver (provides `nvcuda.dll`).
+          - For the **slim** package: a CUDA toolkit matching the package (12.9 for the
+            Turing build, 13.x for the Ada build). The launcher resolves it through the
+            toolkit-set `CUDA_PATH_V<MAJ>_<MIN>` variable.
 
-          ## Files
-          - `whisper-cli.exe` -- the CLI
-          - `ggml-cuda.dll` (~50-60 MB after the sm_75 single-arch cut)
-          - `ggml.dll`, `ggml-base.dll`, `ggml-cpu.dll`, `whisper.dll`
-          - `whisper.bat` -- launcher that resolves CUDA 12.9 via `CUDA_PATH_V12_9`
+          ## Configs in this build
+          ### turing-cuda12.9 -- RTX 2060 / 2070 / 2080 / Titan Xp (Turing sm_75)
+          - CUDA 12.9 (Jimver/cuda-toolkit), `-DCMAKE_CUDA_ARCHITECTURES=75`.
+          - Host launcher uses `CUDA_PATH_V12_9`.
+          ### ada-cuda13.4 -- RTX 4060 (Ada sm_89)
+          - Built against the newest publicly-resolvable CUDA-13 Windows installer
+            (13.3.1); runs on any CUDA 13.x host, including the 4060's CUDA 13.4.
+          - `-DCMAKE_CUDA_ARCHITECTURES=89`; host launcher uses `CUDA_PATH_V13_4`.
 
-          ## Build notes
-          - CUDA 12.9 (Jimver/cuda-toolkit), `-DCMAKE_CUDA_ARCHITECTURES=75` (RTX 2060/2070/2080/Titan Xp).
-          - `GGML_STATIC=ON` => cudart statically linked (no `cudart64_12.dll` needed) -- verified in CI.
-          - cuBLAS stays a DLL -- NVIDIA ships no static `cublas.lib` for Windows (upstream
-            `ggml/src/ggml-cuda/CMakeLists.txt`: "CUDA Toolkit for Windows does not offer a static
-            cublas library"), so `ggml-cuda.dll` links static cudart + dynamic cuBLAS.
-          - Kernels are nvcc-compiled to sm_75 SASS at build time (no NVRTC, no runtime
-            JIT): cold start is instant; the binary is tied to the CUDA 12.9 build.
+          ## Common build notes (all configs)
+          - `GGML_STATIC=ON` => cudart statically linked (no `cudart64_*.dll` needed) -- verified in CI.
+          - cuBLAS stays a DLL -- NVIDIA ships no static `cublas.lib` for Windows, so the
+            CUDA DLL links static cudart + dynamic cuBLAS.
+          - Kernels are nvcc-compiled to a SINGLE-arch SASS at build time (no NVRTC / no
+            runtime JIT): instant cold start, and a much smaller `ggml-cuda.dll`.
           - Tests, server, SDL2, cURL, OpenMP and native-CPU autotuning are off; only
-            `whisper-cli` is compiled (`--target`), so no other example executable builds.
-            The CPU backend is a single baseline variant (GGML_NATIVE=OFF, not the
-            multi-variant matrix).
+            `whisper-cli` is compiled (`--target`). The CPU backend is a single baseline
+            variant (GGML_NATIVE=OFF).
+
+          ## Files (per package)
+          - `whisper-cli.exe` -- the CLI
+          - `ggml-cuda.dll` -- single-arch (see config above)
+          - `ggml.dll`, `ggml-base.dll`, `ggml-cpu.dll`, `whisper.dll`
+          - `whisper.bat` -- launcher that resolves the correct CUDA via `CUDA_PATH_V<MAJ>_<MIN>`
 
           ## CI verification (GPU-less runner)
-          - The CUDA binary cannot be *executed* on a hosted runner (it imports
-            `nvcuda.dll`, the driver, which runners do not have -- would die with
-            0xC0000135 at load). Instead CI:
-            1. builds a CPU-only binary of the same commit and runs a real
-               transcription of `samples/jfk.wav` (tiny.en) -- must exit 0 and
-               contain the expected JFK keywords;
-            2. structurally verifies the CUDA artifacts: no `cudart64_12.dll`
-               import (cudart static), `cublas64_12.dll` + `nvcuda` imports
-               present, `ggml-cuda.dll` single-arch sized (~50-60 MB), sm_75
-               SASS embedded (verified via cuobjdump).
+          The CUDA binary cannot be *executed* on a hosted runner (it imports `nvcuda.dll`,
+          the driver, which runners do not have -- would die with 0xC0000135 at load). Instead CI:
+          1. builds a CPU-only binary of the same commit and runs a real transcription of
+             `samples/jfk.wav` (tiny.en) -- must exit 0 and contain the expected JFK keywords;
+          2. for EVERY config, structurally verifies the CUDA artifacts: no `cudart64_<major>.dll`
+             import (cudart static), `cublas64_<major>.dll` + `nvcuda` imports present,
+             `ggml-cuda.dll` single-arch sized, and the target `sm_<arch>` SASS embedded
+             (verified via cuobjdump).
 
           ## Usage
           ```bat
@@ -424,24 +514,22 @@ jobs:
           BODY
           } > release-body.md
 
-          # Create the release via REST (no local git / tag-pushing; the runner
-          # isn't a checkout target for that). target_commitish is omitted on
-          # purpose: build_sha is the *upstream whisper.cpp* commit, which does
-          # not exist in THIS repo. Default = default branch HEAD.
-          release_id=$(GH_TOKEN="$GH_TOKEN" gh api \
-            -X POST "repos/${{ github.repository }}/releases" \
+          # Create the release via REST (no local git / tag-pushing). target_commitish
+          # is omitted on purpose: build_sha is the upstream whisper.cpp commit, which
+          # does not exist in THIS repo. Default = default branch HEAD.
+          gh api -X POST "repos/${{ github.repository }}/releases" \
             -f "tag_name=${tag}" \
             -f "name=whisper-cli ${label}" \
             -F "body=@release-body.md" \
-            --jq '.id')
+            --jq '.id'
 
-          GH_TOKEN="$GH_TOKEN" gh release upload "${tag}" \
-            "artifacts/whisper-cli-${label}-win-cuda12.9.zip" \
-            "artifacts/whisper-cli-${label}-win-cuda12.9-cublas.zip" --clobber
+          # Upload every config's zips to the single release. zips[] holds full
+          # nested paths (artifacts/pkg-<cfg>/whisper-cli-*.zip) -- pass them as
+          # an explicit array; a flat glob would not match the artifact subfolders.
+          gh release upload "${tag}" "${zips[@]}" --clobber
 
+  # commit-sha: self-commit the newly published upstream SHA (keepalive push).
   commit-sha:
-    # Self-commit the newly published upstream SHA back to this repo. This push is the
-    # llama-slim keepalive pattern -- it keeps the pipeline fresh and re-triggers cleanly.
     needs: [check-upstream, release]
     if: ${{ needs.release.result == 'success' }}
     runs-on: ubuntu-24.04
