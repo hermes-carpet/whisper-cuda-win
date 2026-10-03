@@ -83,13 +83,23 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          set -euo pipefail
-          sha=$(curl -fsSL \
-                  -H "Authorization: Bearer ***" \
-                  -H "Accept: application/vnd.github+json" \
-                  -H "User-Agent: hermes-carpet-whisper-cuda-ci" \
-                  https://api.github.com/repos/ggml-org/whisper.cpp/commits/master \
-                | python3 -c "import json,sys; print(json.load(sys.stdin)['sha'])")
+          set -uo pipefail
+          # ggml-org/whisper.cpp is a public repo: an unauthenticated curl needs
+          # no token at all -- so no auth header to get wrong. Retries a few
+          # times in case of a transient rate-limit / outage.
+          url="https://api.github.com/repos/ggml-org/whisper.cpp/commits/master"
+          sha=""
+          for i in 1 2 3; do
+            sha=$(curl -fsSL --max-time 60 -H "User-Agent: hermes-carpet/ci-rebuild-check" \
+                    "$url" 2>/dev/null | python3 -c "import json,sys; print(json.load(sys.stdin).get('sha',''))" 2>/dev/null || echo "")
+            [ -n "$sha" ] && break
+            echo "attempt $i: unresolved (empty or API error); retrying in 15s"
+            sleep 15
+          done
+          if [ -z "$sha" ]; then
+            echo "ERROR: could not resolve upstream master SHA from $url"
+            exit 1
+          fi
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
           echo "Upstream master: $sha"
 
@@ -256,7 +266,9 @@ jobs:
       matrix:
         include:
           # RTX 2060/2070/2080 / Titan Xp : Turing sm_75, CUDA 12.9.
+          # Jimver/cuda-toolkit resolves 12.9.0 cleanly via its CDN list.
           - cfg: turing-cuda12.9
+            install_method: jimver
             arch: 75
             build_cuda: '12.9.0'       # CUDA toolkit version CI installs
             dll_major: '12'            # cublas64_12.dll / cudart64_12.dll
@@ -265,14 +277,19 @@ jobs:
             gpu: 'RTX 2060 / 2070 / 2080 / Titan Xp (Turing sm_75)'
             arch_short: 'Turing sm_75'
           # RTX 4060 : Ada sm_89, host CUDA 13.4.
-          # Built in CI with CUDA 13.3.1 (newest publicly-resolvable 13.x Windows
-          # installer); runs on any CUDA 13.x host incl. the 4060's CUDA 13.4.
-          # Flip build_cuda to a 13.4.x once NVIDIA ships a Windows 13.4 installer;
-          # host_cuda / host_env_var / the cuda13.4 zip name stay unchanged.
+          # Install path: winget (Nvidia.CUDA 13.4) -- the same path as the
+          # 4060 host. CUDA 13.4 is NOT on NVIDIA's public CDN network_installers
+          # path (probed 13.4.0-13.4.4 all 404), so a direct URL would require
+          # reading the exact path out of the winget manifest. Winget handles it.
+          # If the runner image lacks winget, a PowerShell bootstrap installs it
+          # via Add-AppxPackage.
           - cfg: ada-cuda13.4
+            install_method: winget
             arch: 89
-            build_cuda: '13.3.1'
-            dll_major: '13'
+            build_cuda: '13.4'         # (winget install --version target)
+            winget_id: 'Nvidia.CUDA'
+            winget_version: '13.4'
+            dll_major: '13'            # cublas64_13.dll / cudart64_13.dll
             host_cuda: '13.4'
             host_env_var: 'CUDA_PATH_V13_4'
             gpu: 'RTX 4060 (Ada sm_89)'
@@ -284,6 +301,8 @@ jobs:
       CUDA_ARCH: ${{ matrix.arch }}
       CUDA_MAJOR: ${{ matrix.dll_major }}
       CUDA_BUILD_VER: ${{ matrix.build_cuda }}
+      WINGET_ID: ${{ matrix.winget_id }}
+      WINGET_VERSION: ${{ matrix.winget_version }}
       HOST_CUDA: ${{ matrix.host_cuda }}
       HOST_ENV: ${{ matrix.host_env_var }}
       HOST_GPU: ${{ matrix.gpu }}
@@ -304,12 +323,94 @@ jobs:
           Write-Host "checked out $(git rev-parse HEAD)"
           Pop-Location
 
-      - name: Install CUDA Toolkit ${{ matrix.build_cuda }} (config ${{ matrix.cfg }})
+      # Install CUDA. Jimver path (2060/12.9): standard action, its CDN list covers
+      # 12.9.0. Winget path (4060/13.4): NVIDIA.CUDA is published only through
+      # winget for 13.x (CDN network_installers path 404s for all probed 13.4.x
+      # versions); bootstrap winget itself if the runner image lacks it.
+      - name: Install CUDA ${{ matrix.build_cuda }} via Jimver (config ${{ matrix.cfg }})
+        if: matrix.install_method == 'jimver'
         uses: Jimver/cuda-toolkit@v0.2.36
-        id: cuda
+        id: cuda-jimver
         with:
           cuda: ${{ matrix.build_cuda }}
           method: 'network'
+
+      - name: Install CUDA ${{ matrix.build_cuda }} via winget (config ${{ matrix.cfg }})
+        if: matrix.install_method == 'winget'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $id = $env:WINGET_ID
+          $ver = $env:WINGET_VERSION
+          Write-Host "=== target: $id version $ver ==="
+
+          # 1. Is winget present? (Runner image ships it inconsistently --
+          #    windows-server-based images vary by vintage; detect at runtime.)
+          $winget = $null
+          $cmd = Get-Command winget -ErrorAction SilentlyContinue
+          if ($cmd) {
+            $winget = $cmd.Source
+            Write-Host "winget found: $winget"
+          }
+
+          # 2. If missing, bootstrap App Installer from the winget-cli latest
+          #    release. The MSIX depends on 3 other MSIXes that ship in the
+          #    DesktopAppInstaller_Dependencies.zip asset; install deps first.
+          if (-not $winget) {
+            Write-Host "winget not present -- bootstrapping Microsoft.DesktopAppInstaller"
+            $base = 'https://github.com/microsoft/winget-cli/releases/latest/download'
+            $depsZip  = "$env:TEMP\deps.zip"
+            $msixBundle = "$env:TEMP\desktop-app-installer.msixbundle"
+            Invoke-WebRequest -Uri "$base\DesktopAppInstaller_Dependencies.zip" -OutFile $depsZip -UseBasicParsing
+            $depDir = "$env:TEMP\deps"
+            if (Test-Path $depDir) { Remove-Item $depDir -Recurse -Force }
+            Expand-Archive -Path $depsZip -DestinationPath $depDir
+            $deps = Get-ChildItem $depDir -Filter '*.msix'
+            if ($deps.Count -eq 0) { throw "No dependency MSIXes found under $depDir" }
+            foreach ($d in $deps) {
+              Write-Host "  installing dep: $($d.Name)"
+              Add-AppxPackage -Path $d.FullName
+            }
+            Invoke-WebRequest -Uri "$base/Microsoft.DesktopAppInstaller_8wekyb3d8bbwe.msixbundle" -OutFile $msixBundle -UseBasicParsing
+            Write-Host "  installing DesktopAppInstaller bundle"
+            Add-AppxPackage -Path $msixBundle
+            # Re-detect: first via PATH, then explicitly via the Appx install
+            # root (the winget shim lives under the user's Appx dir). A GHA
+            # runner session may not pick up the shim via PATH until the next
+            # step or profile reload, so fall back to the explicit Appx path.
+            $appxRoot = (Get-AppxPackage -Name "Microsoft.DesktopAppInstaller").InstallLocation
+            $appxWinget = Join-Path $appxRoot "WinGet\Links\winget.exe"
+            for ($i = 0; $i -lt 15; $i++) {
+              $cmd = Get-Command winget -ErrorAction SilentlyContinue
+              if ($cmd) { $winget = $cmd.Source; break }
+              if (Test-Path $appxWinget) { $winget = $appxWinget; break }
+              Start-Sleep -Seconds 3
+            }
+            if (-not $winget) { throw "Could not bootstrap winget from winget-cli latest release" }
+            Write-Host "bootstrapped winget: $winget"
+          }
+
+          # 3. Pin the exact version + package id and install.
+          #    --exact matches the version string; --silent keeps the run fast;
+          #    --accept-* silences license prompts (runner has no interactive user).
+          & $winget install --id $id --version $ver --exact --silent `
+                --accept-package-agreements --accept-source-agreements
+          if ($LASTEXITCODE -ne 0) {
+            throw "winget install $id $ver failed with exit code $LASTEXITCODE"
+          }
+
+          # 4. Verify the toolkit landed where the build cmd expects. winget
+          #    installs to the same path as the regular network installer:
+          #    C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v<maj>.<min>
+          $expected = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v$ver"
+          if (-not (Test-Path "$expected\bin\cudart64_13.dll")) {
+            # List what CUDA versions did land so the failure log is actionable.
+            Write-Host "Expected $expected\bin\cudart64_13.dll -- listing installed:"
+            Get-ChildItem "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA" | ForEach-Object { Write-Host "  $($_.Name)" }
+            throw "CUDA $ver did not land at the expected path"
+          }
+          Add-Content -Path $env:GITHUB_ENV -Value "CUDA_PATH=$expected"
+          Write-Host "CUDA_PATH=$expected (cudart64_13.dll present)"
 
       - name: Install Ninja
         uses: seanmiddleditch/gha-setup-ninja@v5
