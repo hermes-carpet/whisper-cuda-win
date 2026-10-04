@@ -277,18 +277,20 @@ jobs:
             gpu: 'RTX 2060 / 2070 / 2080 / Titan Xp (Turing sm_75)'
             arch_short: 'Turing sm_75'
           # RTX 4060 : Ada sm_89, host CUDA 13.4.
-          # Install path: winget (Nvidia.CUDA 13.4) -- the same path as the
-          # 4060 host. CUDA 13.4 is NOT on NVIDIA's public CDN network_installers
-          # path (probed 13.4.0-13.4.4 all 404), so a direct URL would require
-          # reading the exact path out of the winget manifest. Winget handles it.
-          # If the runner image lacks winget, a PowerShell bootstrap installs it
-          # via Add-AppxPackage.
+          # Primary install: winget (Nvidia.CUDA, version line 13.4) -- the same
+          # route as the 4060 host, and it survives NVIDIA changing installer
+          # URLs or patch numbers (winget resolves from its manifest; no
+          # --exact, so a future 13.4.3 manifest still matches the "13.4" line).
+          # Fallback ONLY: if the winget install fails, install the pinned
+          # direct network installer (10 MB stub; components come from
+          # NVIDIA's CDN during install). Bump that URL only if BOTH paths fail.
           - cfg: ada-cuda13.4
             install_method: winget
             arch: 89
-            build_cuda: '13.4'         # (winget install --version target)
+            build_cuda: '13.4'
             winget_id: 'Nvidia.CUDA'
             winget_version: '13.4'
+            fallback_installer: 'https://developer.download.nvidia.com/compute/cuda/13.4.2/network_installers/cuda_13.4.2_windows_x86_64_network.exe'
             dll_major: '13'            # cublas64_13.dll / cudart64_13.dll
             host_cuda: '13.4'
             host_env_var: 'CUDA_PATH_V13_4'
@@ -303,6 +305,7 @@ jobs:
       CUDA_BUILD_VER: ${{ matrix.build_cuda }}
       WINGET_ID: ${{ matrix.winget_id }}
       WINGET_VERSION: ${{ matrix.winget_version }}
+      FALLBACK_INSTALLER: ${{ matrix.fallback_installer }}
       HOST_CUDA: ${{ matrix.host_cuda }}
       HOST_ENV: ${{ matrix.host_env_var }}
       HOST_GPU: ${{ matrix.gpu }}
@@ -323,10 +326,14 @@ jobs:
           Write-Host "checked out $(git rev-parse HEAD)"
           Pop-Location
 
-      # Install CUDA. Jimver path (2060/12.9): standard action, its CDN list covers
-      # 12.9.0. Winget path (4060/13.4): NVIDIA.CUDA is published only through
-      # winget for 13.x (CDN network_installers path 404s for all probed 13.4.x
-      # versions); bootstrap winget itself if the runner image lacks it.
+      # Install CUDA.
+      #   jimver (2060 / CUDA 12.9): the Jimver/cuda-toolkit action -- its CDN
+      #   list resolves 12.9.0 cleanly.
+      #   winget (4060 / CUDA 13.4): primary path is `winget install
+      #   Nvidia.CUDA` (the same route as the 4060 host). Winget resolves the
+      #   installer from its manifest, so a stale hardcoded URL can never break
+      #   the run. The pinned direct network installer (10 MB stub) is the
+      #   FALLBACK ONLY, reached if and only if winget fails end-to-end.
       - name: Install CUDA ${{ matrix.build_cuda }} via Jimver (config ${{ matrix.cfg }})
         if: matrix.install_method == 'jimver'
         uses: Jimver/cuda-toolkit@v0.2.36
@@ -335,83 +342,117 @@ jobs:
           cuda: ${{ matrix.build_cuda }}
           method: 'network'
 
-      - name: Install CUDA ${{ matrix.build_cuda }} via winget (config ${{ matrix.cfg }})
+      - name: Install CUDA ${{ matrix.build_cuda }} via winget, direct fallback (config ${{ matrix.cfg }})
         if: matrix.install_method == 'winget'
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $id = $env:WINGET_ID
-          $ver = $env:WINGET_VERSION
-          Write-Host "=== target: $id version $ver ==="
+          $id       = $env:WINGET_ID
+          $ver      = $env:WINGET_VERSION
+          $major    = $env:CUDA_MAJOR
+          $fallback = $env:FALLBACK_INSTALLER
+          $cudaDir  = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v$ver"
+          Write-Host "installing CUDA line $ver (winget id: $id), expecting toolkit at $cudaDir"
 
-          # 1. Is winget present? (Runner image ships it inconsistently --
-          #    windows-server-based images vary by vintage; detect at runtime.)
-          $winget = $null
-          $cmd = Get-Command winget -ErrorAction SilentlyContinue
-          if ($cmd) {
-            $winget = $cmd.Source
-            Write-Host "winget found: $winget"
+          function Test-ToolkitPresent {
+            param([string]$dir)
+            return (Test-Path (Join-Path $dir "bin\nvcc.exe")) -and
+                   (Test-Path (Join-Path $dir "bin\cublas64_$major.dll"))
+          }
+          function Find-Winget {
+            $c = Get-Command winget -ErrorAction SilentlyContinue
+            if ($c) { return $c.Source }
+            # A bootstrapped Appx winget may not be on this session's PATH yet;
+            # the shim lives at a known path under the package install root.
+            $p = Get-AppxPackage -Name Microsoft.DesktopAppInstaller -ErrorAction SilentlyContinue
+            if ($p) {
+              $l = Join-Path $p.InstallLocation "WinGet\Links\winget.exe"
+              if (Test-Path $l) { return $l }
+            }
+            return $null
           }
 
-          # 2. If missing, bootstrap App Installer from the winget-cli latest
-          #    release. The MSIX depends on 3 other MSIXes that ship in the
-          #    DesktopAppInstaller_Dependencies.zip asset; install deps first.
-          if (-not $winget) {
-            Write-Host "winget not present -- bootstrapping Microsoft.DesktopAppInstaller"
-            $base = 'https://github.com/microsoft/winget-cli/releases/latest/download'
-            $depsZip  = "$env:TEMP\deps.zip"
-            $msixBundle = "$env:TEMP\desktop-app-installer.msixbundle"
-            Invoke-WebRequest -Uri "$base\DesktopAppInstaller_Dependencies.zip" -OutFile $depsZip -UseBasicParsing
-            $depDir = "$env:TEMP\deps"
-            if (Test-Path $depDir) { Remove-Item $depDir -Recurse -Force }
-            Expand-Archive -Path $depsZip -DestinationPath $depDir
-            $deps = Get-ChildItem $depDir -Filter '*.msix'
-            if ($deps.Count -eq 0) { throw "No dependency MSIXes found under $depDir" }
+          # --- 1. Locate winget; bootstrap App Installer (Appx) if absent ------
+          $w = Find-Winget
+          if ($w) {
+            Write-Host "winget present: $w"
+          } else {
+            Write-Host "winget not on this image -- bootstrapping Microsoft.DesktopAppInstaller (Appx)"
+            $base   = 'https://github.com/microsoft/winget-cli/releases/latest/download'
+            $depZ   = "$env:TEMP\daapp-deps.zip"
+            $bundle = "$env:TEMP\daapp.msixbundle"
+            Invoke-WebRequest -Uri "$base/DesktopAppInstaller_Dependencies.zip" -OutFile $depZ -UseBasicParsing
+            $depD = "$env:TEMP\daapp-deps"
+            if (Test-Path $depD) { Remove-Item $depD -Recurse -Force }
+            Expand-Archive -Path $depZ -DestinationPath $depD
+            $deps = @(Get-ChildItem $depD -Filter *.msix)
+            if ($deps.Count -eq 0) { throw "No dependency MSIXes extracted to $depD" }
             foreach ($d in $deps) {
-              Write-Host "  installing dep: $($d.Name)"
+              Write-Host "  Add-AppxPackage dep: $($d.Name)"
               Add-AppxPackage -Path $d.FullName
             }
-            Invoke-WebRequest -Uri "$base/Microsoft.DesktopAppInstaller_8wekyb3d8bbwe.msixbundle" -OutFile $msixBundle -UseBasicParsing
-            Write-Host "  installing DesktopAppInstaller bundle"
-            Add-AppxPackage -Path $msixBundle
-            # Re-detect: first via PATH, then explicitly via the Appx install
-            # root (the winget shim lives under the user's Appx dir). A GHA
-            # runner session may not pick up the shim via PATH until the next
-            # step or profile reload, so fall back to the explicit Appx path.
-            $appxRoot = (Get-AppxPackage -Name "Microsoft.DesktopAppInstaller").InstallLocation
-            $appxWinget = Join-Path $appxRoot "WinGet\Links\winget.exe"
-            for ($i = 0; $i -lt 15; $i++) {
-              $cmd = Get-Command winget -ErrorAction SilentlyContinue
-              if ($cmd) { $winget = $cmd.Source; break }
-              if (Test-Path $appxWinget) { $winget = $appxWinget; break }
+            Invoke-WebRequest -Uri "$base/Microsoft.DesktopAppInstaller_8wekyb3d8bbwe.msixbundle" -OutFile $bundle -UseBasicParsing
+            Write-Host "  Add-AppxPackage: Microsoft.DesktopAppInstaller bundle"
+            Add-AppxPackage -Path $bundle
+            for ($i = 0; $i -lt 10; $i++) {
+              $w = Find-Winget
+              if ($w) { break }
               Start-Sleep -Seconds 3
             }
-            if (-not $winget) { throw "Could not bootstrap winget from winget-cli latest release" }
-            Write-Host "bootstrapped winget: $winget"
+            if ($w) {
+              Write-Host "winget bootstrapped: $w"
+            } else {
+              Write-Host "WARN: Appx bootstrap finished but winget still not found -- using the direct installer"
+            }
           }
 
-          # 3. Pin the exact version + package id and install.
-          #    --exact matches the version string; --silent keeps the run fast;
-          #    --accept-* silences license prompts (runner has no interactive user).
-          & $winget install --id $id --version $ver --exact --silent `
-                --accept-package-agreements --accept-source-agreements
-          if ($LASTEXITCODE -ne 0) {
-            throw "winget install $id $ver failed with exit code $LASTEXITCODE"
+          # --- 2. PRIMARY: winget install (matches the 13.4 version line; no
+          #          --exact, so future 13.4.x manifest bumps still resolve) ----
+          if ($w) {
+            $wlog = "$env:TEMP\winget-install.log"
+            Write-Host "--- winget install --id $id --version $ver ---"
+            # Native stdout/stderr goes to a log file (not a PS pipeline), so
+            # installer text cannot interact with $ErrorActionPreference.
+            & $w install --id $id --version $ver --silent `
+                  --accept-package-agreements --accept-source-agreements *> $wlog
+            $wrc = $LASTEXITCODE
+            Write-Host "----- winget log (exit=$wrc) -----"
+            Get-Content $wlog -ErrorAction SilentlyContinue
+          } else {
+            Write-Host "winget unavailable; skipping to direct installer"
           }
 
-          # 4. Verify the toolkit landed where the build cmd expects. winget
-          #    installs to the same path as the regular network installer:
-          #    C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v<maj>.<min>
-          $expected = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v$ver"
-          if (-not (Test-Path "$expected\bin\cudart64_13.dll")) {
-            # List what CUDA versions did land so the failure log is actionable.
-            Write-Host "Expected $expected\bin\cudart64_13.dll -- listing installed:"
-            Get-ChildItem "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA" | ForEach-Object { Write-Host "  $($_.Name)" }
-            throw "CUDA $ver did not land at the expected path"
+          # --- 3. FALLBACK: direct NVIDIA network installer (10 MB stub; the
+          #          network install streams components from NVIDIA's CDN).
+          #          Only reached when the winget path did not produce a usable
+          #          toolkit, so a stale URL can never break an otherwise-good run.
+          if (-not (Test-ToolkitPresent $cudaDir)) {
+            Write-Host "=== FALLBACK: direct installer: $fallback ==="
+            $exe = "$env:TEMP\cuda-net-installer.exe"
+            Invoke-WebRequest -Uri $fallback -OutFile $exe -UseBasicParsing
+            Write-Host ("installer stub: {0:N0} bytes" -f (Get-Item $exe).Length)
+            $p = Start-Process -FilePath $exe -ArgumentList @('/s','/norestart') -Wait -PassThru
+            Write-Host "installer exit code: $($p.ExitCode)"
+            if ($p.ExitCode -ne 0) { throw "direct CUDA network installer exited $($p.ExitCode)" }
           }
-          Add-Content -Path $env:GITHUB_ENV -Value "CUDA_PATH=$expected"
-          Write-Host "CUDA_PATH=$expected (cudart64_13.dll present)"
 
+          # --- 4. Verify the toolkit wherever it landed (both paths) -----------
+          if (-not (Test-ToolkitPresent $cudaDir)) {
+            Write-Host "FAIL: usable CUDA toolkit not found at $cudaDir (need bin\nvcc.exe and bin\cublas64_$major.dll)"
+            Write-Host "installed toolkit versions present:"
+            $root = 'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA'
+            if (Test-Path $root) {
+              Get-ChildItem $root | ForEach-Object { Write-Host "  $($_.Name)" }
+            } else {
+              Write-Host "  (no CUDA toolkit directory at all)"
+            }
+            throw "CUDA $ver install failed -- see the winget log section above for the primary-path failure"
+          }
+          Write-Host "=== CUDA $ver toolkit verified at $cudaDir ==="
+          # Export for the build/verify steps that run as separate steps.
+          Set-Content -Path $env:GITHUB_ENV -Value "CUDA_PATH=$cudaDir"
+          & "$cudaDir\bin\nvcc.exe" --version
+          Write-Host ("cublas: {0:N1} MB" -f ((Get-Item (Join-Path $cudaDir "bin\cublas64_$major.dll")).Length / 1MB))
       - name: Install Ninja
         uses: seanmiddleditch/gha-setup-ninja@v5
 
