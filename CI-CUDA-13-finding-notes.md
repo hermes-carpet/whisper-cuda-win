@@ -22,40 +22,69 @@ no `Add-AppxPackage`, no manual `Invoke-WebRequest` installer download, no 3.6 G
 
 ---
 
-## Why 13.4 broke (root cause, verified from real logs)
+## Why the 13.4 (and would-be 13.3) build broke — root cause, corrected & verified
 
-It was **not** a compile or link failure. The build step was never run — the run
-died in the **install gate**:
+**Corrected diagnosis (probe round on 13.3.1, the shipping route):** the CUDA 13.x
+Windows installer does **not** keep the runtime DLLs in `bin\` where 12.x put them —
+**13.x installs them in `bin\x64\`**. Everything else stayed put, which is why the
+failure was silent and confusing:
 
-1. The Windows CUDA **13.4** silent install (`-s`) installs the whole **build** surface:
-   `nvcc.exe`, `cuobjdump.exe`, `lib\x64\cublas.lib`, `lib\x64\cudart_static.lib`,
-   `include\cublas_api.h`. **All present** (confirmed by probe, install exit 0).
-2. But it does **NOT** place the cuBLAS **runtime** `bin\cublas64_13.dll`. In the 13.x
-   Windows installer, the cuBLAS **runtime** DLL landed in a separate **sub-package**
-   (`cublas_13.4`), not in the compiler-core default set.
-3. `auto-rebuild.yml`'s `Get-ToolkitDir` gate (line ~361) requires
-   `bin\nvcc.exe` **AND** `bin\cublas64_$major.dll`. The DLL is missing → gate fails →
-   "CUDA 13.4 install failed" → build step **skipped** → whole job red.
+| Artifact | 12.9 location | 13.x location (verified) |
+|----------|---------------|---------------------------|
+| `nvcc.exe`, `cuobjdump.exe`, … | `bin\` | `bin\` (unchanged) |
+| `cublas.lib`, `cudart_static.lib`, … | `lib\x64\` | `lib\x64\` (unchanged) |
+| `cublas_api.h`, … | `include\` | `include\` (unchanged) |
+| **`cublas64_<N>.dll`, `cudart64_<N>.dll`** | `bin\` | **`bin\x64\`** ← moved |
 
-Probe VERDICT (13.4, `-s`, single clean invocation):
-```
-VERDICT variant=S-baseline-s: nvcc=True cuobjdump=True cublas_dl=False
-                               cublas_lib=True cudart_static=True cublas_hdr=True
-```
-Only `cublas_dl=False` — the runtime DLL. Everything a build needs *except* the DLL
-that the packaging `portable` variant bundles and the gate checks.
+(An earlier theory — "cuBLAS moved to a sub-package that must be opted into" — was
+**wrong**: the 13.3.1 probe found the full 52 MB `cublas64_13.dll` and
+`cudart64_13.dll` installed, just under `bin\x64\`.)
 
-Secondary 13.4 pain (winget path, real log):
+The build itself *links* against `lib\x64\cublas.lib` + `cudart_static.lib` (present
+on both), so compilation succeeds. What broke was every `bin\cublas64_13.dll` /
+`bin\cudart64_13.dll` check:
+1. `auto-rebuild.yml`'s install gate (`Get-ToolkitDir` required `bin\cublas64_$major.dll`)
+2. `scripts\build-whisper-cuda.cmd`'s `:have_cudart` / `:have_cublas` existence gates
+3. the portable `-cublas` packaging step (gathered `cublas*.dll` from `bin\` → would
+   bundle **nothing** on 13.x)
+4. the `whisper.bat` host launcher (puts `%CUDA_PATH_Vx_x%\bin` first on PATH → wrong
+   folder on any 13.x host, including the desktop)
+
+### The fix (version-independent, committed `0214af4`)
+Every `bin\` reference now also covers `bin\x64\` (12.x and 13.x both work with one
+script / one launcher). Verified green: run `37181584176` (force) → both legs
+(`turing-cuda12.9` AND `ada-cuda13.3` at 13.3.1) `completed success`, CPU smoke
+success.
+
+Why 13.3.1 via Jimver (not 13.4 via winget) for the Ada lane:
+- **Same proven route as 12.9** — `Jimver/cuda-toolkit` `method: network`; Jimver's
+  CDN map resolves 13.3.1 (verified in `src/links/windows-links.ts`, updated Aug 2026).
+  No winget Appx bootstrap (that 404/0x80073CF3 mess), no manual installer download,
+  no hardcoded NVIDIA URL.
+- **13.4 is not in Jimver's map**, so it would have needed the winget/bootstrap path
+  anyway.
+- 13.3-built binary runs on a 13.x host (same major); ".3 -> .4 has no advantages
+  for STT."
+
+Secondary 13.4 pain (winget path, real log, for reference):
 - Runner had **no winget**; bootstrap failed:
   `Add-AppxPackage : Deployment failed with HRESULT: 0x80073CF3` → "winget unavailable".
 - Fell through to the **manual `Invoke-WebRequest` installer** download+run — the
   "actions manually download the installer" path the user doesn't want.
-- That direct 13.4.1 local install exited 0 but still failed the `Get-ToolkitDir` gate.
 
 ### The 13.4 bootstrapper gotcha (probe round 2)
 If the 13.4 bootstrapper is run **twice on the same runner** (e.g. a `-h`/usage dump
 then a real install), the second call dies with exit code **`-469762040`** and installs
-*nothing*. On `windows-2022`, run the 13.4 bootstrapper **exactly once** per machine.
+*nothing*. On `windows-2022`, run a 13.4 bootstrapper invocation **exactly once** per
+machine. (Moot now that 13.4 is out of the picture, but it bit three probe rounds.)
+
+### Release-publish gotcha (bit run `37181584176`, fixed in `09d2458`)
+The release step's idempotency was `gh api -X DELETE … || true`. A transient API
+failure left the stale `whisper-1.9.4-dev` tag in place and the POST 422'd with
+`tag_name already_exists`. Fixed: retry-verify loop (GET → DELETE → GET-404, 5
+attempts, hard-fail). Note for future deletes: `DELETE /releases/{id}` returns **204
+with an empty body** — any `-q` jq post-filter makes the call "fail" (jq gets EOF);
+check the HTTP code, not the body.
 
 ---
 
