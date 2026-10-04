@@ -11,12 +11,14 @@ Two configs per release:
 | `ada-cuda13.3` | RTX 4060 | sm_89 | 13.3 |
 
 Mirrors the `hermes-carpet/llama-slim` pattern: a **weekly cron** (Tue 09:00 UTC)
-polls `ggml-org/whisper.cpp` master. When a new upstream commit appears and the build
-**passes a CPU smoke test** on the no-GPU runner, it publishes a GitHub Release
-containing every config's two zips and **self-commits** the published SHA back to
-this repo. That self-commit keeps the pipeline fresh (no GitHub inactivity timeout)
-and is the next poll's "already done" marker. A failed build or test publishes
-nothing — the last passing release stays.
+polls `ggml-org/whisper.cpp` master. It rebuilds **only when the upstream version
+number changes** (the `WHISPER_VERSION` in whisper.cpp's `CMakeLists.txt`) — not on
+every master commit — so a post-release development commit is skipped. When a version
+bump is detected and the build **passes a CPU smoke test** on the no-GPU runner, it
+publishes a GitHub Release containing every config's two zips and **self-commits**
+the published SHA back to this repo. That self-commit keeps the pipeline fresh (no
+GitHub inactivity timeout) and is the next poll's "already done" marker. A failed
+build or test publishes nothing — the last passing release stays.
 
 Each release is named after the **upstream version** parsed from whisper.cpp's
 `CMakeLists.txt` (e.g. **1.9.4**). If the commit is exactly the upstream `vX.Y.Z`
@@ -98,11 +100,14 @@ Or call `whisper-cli.exe` directly if you already have the matching CUDA toolkit
 `.github/workflows/auto-rebuild.yml`:
 
 - **Weekly** (`schedule`): Tuesday 09:00 UTC — polls `ggml-org/whisper.cpp` master.
-- **`workflow_dispatch`** — manual; pass `upstream_sha` (optional) and `force`
-  to rebuild a specific/published SHA.
+  Rebuilds only if the upstream **version number** (CMakeLists `WHISPER_VERSION`)
+  differs from the last published build; otherwise it exits fast with no build.
+- **`workflow_dispatch`** — manual; pass `upstream_sha` (optional), to build a
+  specific master commit even mid-version, and/or `force=true` to rebuild even when
+  the version is already published.
 
-On a new SHA it: (1) shallow-fetches upstream at that SHA (ggml is vendored, no
-submodules), (2) installs CUDA per config via `Jimver/cuda-toolkit`
+When its trigger fires it: (1) shallow-fetches upstream at that SHA (ggml is
+vendored, no submodules), (2) installs CUDA per config via `Jimver/cuda-toolkit`
 (`method: network` — 12.9.0 for Turing, 13.3.1 for Ada; the action resolves the
 installer from its own CDN map, so no hardcoded NVIDIA URL can go stale, and it
 avoids the winget Appx-bootstrap path that hosted runners break on), (3) configures
