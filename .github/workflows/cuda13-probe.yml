@@ -1,0 +1,111 @@
+# PROBE (diagnostic, dispatch-only): determine the CUDA 13.4 silent-install recipe that
+# actually lands nvcc + cublas64_13.dll on a windows-2022 hosted runner.
+#
+# Background: 2026-generation runners ship no winget AND cannot bootstrap App
+# Installer (App Installer 1.29.x needs the Microsoft.WindowsAppRuntime.1.8
+# framework, not present), so for CUDA 13.4 (Jimver tops out at 13.3.1) the direct
+# NVIDIA installer IS the install path. The first attempt (-y -gm2 -s -n /norestart)
+# exited 0 but did not land the toolkit -- the silent installer returns before the
+# MSI files arrive. This probe tests installer-type x flag combos in PARALLEL
+# (separate fresh runners, no crosstalk), with nvcc-landing poll + sha verification,
+# and prints a full toolkit diagnostic so the log alone tells us the answer.
+#
+# Winner gets baked into the ada leg of auto-rebuild.yml. Delete once green.
+name: cuda13-probe
+on:
+  workflow_dispatch: {}
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: windows-2022
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # A: LOCAL (3.5GB, all files embedded) + proven Jimver single-flag -s
+          - { variant: 'A-local-s',
+              url: 'https://developer.download.nvidia.com/compute/cuda/13.4.1/local_installers/cuda_13.4.1_windows_x86_64.exe',
+              sha: '0000', flags: '-s' }
+          # B: LOCAL + `-s -t` (silent, toolkit-only single phase, no download/staging)
+          - { variant: 'B-local-s-t',
+              url: 'https://developer.download.nvidia.com/compute/cuda/13.4.1/local_installers/cuda_13.4.1_windows_x86_64.exe',
+              sha: '0000', flags: '-s -t' }
+          # C: NETWORK stub (10MB, streams from CDN) + `-s -t`  (fast download to test)
+          - { variant: 'C-net-s-t',
+              url: 'https://developer.download.nvidia.com/compute/cuda/13.4.2/network_installers/cuda_13.4.2_windows_x86_64_network.exe',
+              sha: '0000', flags: '-s -t' }
+          # D: NETWORK stub + acceptance flags (-y -s -n) in case -t needs consent
+          - { variant: 'D-net-y-s-n',
+              url: 'https://developer.download.nvidia.com/compute/cuda/13.4.2/network_installers/cuda_13.4.2_windows_x86_64_network.exe',
+              sha: '0000', flags: '-y -s -n' }
+    name: probe [${{ matrix.variant }}]
+    env:
+      variant: ${{ matrix.variant }}
+      url: ${{ matrix.url }}
+      sha_expected: ${{ matrix.sha }}
+      flags: ${{ matrix.flags }}
+    steps:
+      - name: Install CUDA 13.4 and dump toolkit diagnostic
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = 'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA'
+          $d    = Join-Path $root 'v13.4'
+          $nvcc = Join-Path $d 'bin\nvcc.exe'
+          $cub  = Join-Path $d 'bin\cublas64_13.dll'
+          $flags = $env:flags
+
+          Write-Host "=== VARIANT $env:variant | flags: $flags ==="
+          Write-Host "    url: $env:url"
+
+          # --- download + size sanity + sha check -----------------------------
+          $exe = Join-Path $env:TEMP 'cuda-probe.exe'
+          if (Test-Path $exe) { Remove-Item $exe -Force }
+          Write-Host 'downloading installer...'
+          Invoke-WebRequest -Uri $env:url -OutFile $exe -UseBasicParsing
+          $sizeMb = (Get-Item $exe).Length / 1MB
+          Write-Host ("downloaded: {0:N1} MB" -f $sizeMb)
+          if ($sizeMb -lt 5 -or $sizeMb -gt 8000) { Write-Host "size out of range -- abort"; exit 2 }
+          $hash = (Get-FileHash $exe -Algorithm SHA256).Hash
+          Write-Host "sha256(actual)  = $hash"
+          if ($env:sha_expected -ne '0000' -and $hash -ne $env:sha_expected) {
+            Write-Host "SHA MISMATCH (expected $env:sha_expected) -- not running"; exit 3
+          }
+
+          # --- run installer silently ------------------------------------------
+          Write-Host "running: $exe  $flags"
+          $t0 = Get-Date
+          $p = Start-Process -FilePath $exe -ArgumentList $flags -Wait -PassThru
+          $t1 = Get-Date
+          Write-Host ("Start-Process -Wait returned exit={0} after {1:N0}s" -f $p.ExitCode, ($t1-$t0).TotalSeconds)
+
+          # --- completion poll: silent installer may return before files land --
+          $found = $false
+          for ($i=0; $i -lt 30; $i++) {
+            if ((Test-Path $nvcc) -and (Test-Path $cub)) { $found = $true; break }
+            Start-Sleep -Seconds 20
+          }
+          Write-Host ("nvcc_landed={0} cublas_landed={1} (after {2:N0}s)" -f (Test-Path $nvcc), (Test-Path $cub), ((Get-Date)-$t1).TotalSeconds)
+
+          # --- full toolkit diagnostic -----------------------------------------
+          Write-Host '=== v13.4\bin nvidia DLLs (cublas/nvrtc/cudart/cufft) ==='
+          $bin = Join-Path $d 'bin'
+          if (Test-Path $bin) {
+            $dlls = Get-ChildItem $bin -Filter '*.dll' | Where-Object { $_.Name -match 'cublas|nvrtc|cudart|cufft' }
+            $dlls | ForEach-Object { Write-Host ("  {0,12:N0}  {1}" -f $_.Length, $_.Name) }
+            if (-not $dlls) { Write-Host '  (no cublas/nvrtc/cudart/cufft DLLs)' }
+            Write-Host ("  nvcc.exe present: {0}   total bin files: {1}" -f ((Get-ChildItem $bin -Filter 'nvcc.exe' -ErrorAction SilentlyContinue | Measure-Object).Count -gt 0), (Get-ChildItem $bin).Count))
+          } else { Write-Host '  v13.4\bin DIR MISSING' }
+          Write-Host '=== CUDA root ==='
+          if (Test-Path $root) { Get-ChildItem $root | ForEach-Object { Write-Host "  $($_.Name)" } }
+          else { Write-Host '  (no CUDA toolkit root at all)' }
+
+          if ($found) {
+            Write-Host "=== VARIANT $env:variant  WORKS  (flags: $flags) ==="
+            & $nvcc --version
+          } else {
+            Write-Host "=== VARIANT $env:variant  DID NOT WORK  (flags: $flags) ==="
+            throw "variant $env:variant failed: nvcc=$(Test-Path $nvcc) cublas=$(Test-Path $cub)"
+          }
