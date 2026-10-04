@@ -96,7 +96,7 @@ jobs:
             $dlls = Get-ChildItem $bin -Filter '*.dll' | Where-Object { $_.Name -match 'cublas|nvrtc|cudart|cufft' }
             $dlls | ForEach-Object { Write-Host ("  {0,12:N0}  {1}" -f $_.Length, $_.Name) }
             if (-not $dlls) { Write-Host '  (no cublas/nvrtc/cudart/cufft DLLs)' }
-            Write-Host ("  nvcc.exe present: {0}   total bin files: {1}" -f ((Get-ChildItem $bin -Filter 'nvcc.exe' -ErrorAction SilentlyContinue | Measure-Object).Count -gt 0), (Get-ChildItem $bin).Count))
+            Write-Host ("  nvcc.exe present: {0}   total bin files: {1}" -f ((Get-ChildItem $bin -Filter 'nvcc.exe' -ErrorAction SilentlyContinue | Measure-Object).Count -gt 0), (Get-ChildItem $bin).Count)
           } else { Write-Host '  v13.4\bin DIR MISSING' }
           Write-Host '=== CUDA root ==='
           if (Test-Path $root) { Get-ChildItem $root | ForEach-Object { Write-Host "  $($_.Name)" } }
