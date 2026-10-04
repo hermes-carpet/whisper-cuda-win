@@ -8,7 +8,7 @@
 # one-line addition. The two configs today:
 #
 #   turing-cuda12.9 : RTX 2060/2070/2080 / Titan Xp (Turing sm_75), CUDA 12.9
-#   ada-cuda13.4    : RTX 4060 (Ada sm_89), host CUDA 13.4
+#   ada-cuda13.3    : RTX 4060 (Ada sm_89), host CUDA 13.3
 #
 # CUDA binary CANNOT be executed on a hosted runner: ggml-cuda.dll imports
 # nvcuda.dll (the NVIDIA driver, only on the target machine) -> 0xC0000135 at load.
@@ -23,12 +23,18 @@
 # where <label> is the upstream version label (e.g. 1.9.4 or 1.9.4-dev) and the
 # release tag is whisper-<label>.
 #
-# Note on the 4060 CUDA: it targets host CUDA 13.4 (whisper.bat resolves
-# %CUDA_PATH_V13_4%). CI builds it against CUDA 13.4, installed from the winget
-# winget-pkgs manifest route (see the "via winget" step) with the NVIDIA network
-# installer as a last-resort fallback. A 13.4-built binary links cublas64_13.dll
-# and runs on any CUDA 13.x host; the zip suffix (cuda13.4) and the host env var
-# (CUDA_PATH_V13_4) never change across 13.x patch levels.
+# Note on the 4060 CUDA: it targets host CUDA 13.3 (whisper.bat resolves
+# %CUDA_PATH_V13_3%). CI builds it against CUDA 13.3.1 via Jimver/cuda-toolkit
+# (method: network) -- the SAME route-and-source as the 12.9 lane: no winget
+# Appx bootstrap, no manual installer download, no hardcoded NVIDIA URL (Jimver
+# resolves the patch from its own CDN map). A 13.3-built binary links
+# cublas64_13.dll and runs on any CUDA 13.x host; the zip suffix (cuda13.3) and
+# the host env var (CUDA_PATH_V13_3) never change across 13.x patch levels.
+# Why 13.3 and not 13.4: the 13.4 Windows installer does NOT put the cuBLAS
+# runtime DLL in bin\ (it moved to a separate sub-package), which broke both
+# the build gate and scripts\build-whisper-cuda.cmd's cublas64_13.dll check.
+# 13.3 keeps the runtime DLL in bin\ (like 12.9), so the whole path is
+# unblocked with the same route the working lane already uses.
 #
 # State: `upstream-sha` (repo root) = last published upstream SHA. The commit-sha
 # job self-commits it back -- the llama-slim keepalive pattern.
@@ -276,24 +282,20 @@ jobs:
             host_env_var: 'CUDA_PATH_V12_9'
             gpu: 'RTX 2060 / 2070 / 2080 / Titan Xp (Turing sm_75)'
             arch_short: 'Turing sm_75'
-          # RTX 4060 : Ada sm_89, host CUDA 13.4.
-          # Primary install: winget (Nvidia.CUDA, version line 13.4) -- the same
-          # route as the 4060 host, and it survives NVIDIA changing installer
-          # URLs or patch numbers (winget resolves from its manifest; no
-          # --exact, so a future 13.4.3 manifest still matches the "13.4" line).
-          # Fallback ONLY: if the winget install fails, install the pinned
-          # direct network installer (10 MB stub; components come from
-          # NVIDIA's CDN during install). Bump that URL only if BOTH paths fail.
-          - cfg: ada-cuda13.4
-            install_method: winget
+          # RTX 4060 : Ada sm_89, host CUDA 13.3.
+          # Install: Jimver/cuda-toolkit (method: network), the SAME source-and-route
+          # as the 12.9 lane. Jimver resolves the 13.3.x patch from its own CDN map,
+          # so a stale hardcoded NVIDIA URL can never break the run, and no winget
+          # Appx bootstrap / manual download is needed. 13.3 is used (not 13.4)
+          # because the 13.4 Windows installer moved the cuBLAS runtime out of bin\
+          # into a sub-package, which broke the cuBLAS-in-bin\ gate here.
+          - cfg: ada-cuda13.3
+            install_method: jimver
             arch: 89
-            build_cuda: '13.4'
-            winget_id: 'Nvidia.CUDA'
-            winget_version: '13.4'
-            fallback_installer: 'https://developer.download.nvidia.com/compute/cuda/13.4.2/network_installers/cuda_13.4.2_windows_x86_64_network.exe'
-            dll_major: '13'            # cublas64_13.dll / cudart64_13.dll
-            host_cuda: '13.4'
-            host_env_var: 'CUDA_PATH_V13_4'
+            build_cuda: '13.3.1'     # CUDA toolkit version CI installs (13.3 line, newest patch in Jimver's map)
+            dll_major: '13'          # cublas64_13.dll / cudart64_13.dll
+            host_cuda: '13.3'
+            host_env_var: 'CUDA_PATH_V13_3'
             gpu: 'RTX 4060 (Ada sm_89)'
             arch_short: 'Ada sm_89'
     env:
@@ -303,9 +305,6 @@ jobs:
       CUDA_ARCH: ${{ matrix.arch }}
       CUDA_MAJOR: ${{ matrix.dll_major }}
       CUDA_BUILD_VER: ${{ matrix.build_cuda }}
-      WINGET_ID: ${{ matrix.winget_id }}
-      WINGET_VERSION: ${{ matrix.winget_version }}
-      FALLBACK_INSTALLER: ${{ matrix.fallback_installer }}
       HOST_CUDA: ${{ matrix.host_cuda }}
       HOST_ENV: ${{ matrix.host_env_var }}
       HOST_GPU: ${{ matrix.gpu }}
@@ -327,13 +326,11 @@ jobs:
           Pop-Location
 
       # Install CUDA.
-      #   jimver (2060 / CUDA 12.9): the Jimver/cuda-toolkit action -- its CDN
-      #   list resolves 12.9.0 cleanly.
-      #   winget (4060 / CUDA 13.4): primary path is `winget install
-      #   Nvidia.CUDA` (the same route as the 4060 host). Winget resolves the
-      #   installer from its manifest, so a stale hardcoded URL can never break
-      #   the run. The pinned direct network installer (10 MB stub) is the
-      #   FALLBACK ONLY, reached if and only if winget fails end-to-end.
+      #   Both lanes now use Jimver/cuda-toolkit (method: network):
+      #     - 2060 / CUDA 12.9  -> Jimver resolves 12.9.0 (proven green)
+      #     - 4060 / CUDA 13.3  -> Jimver resolves 13.3.1 from its own CDN map
+      #   No winget Appx bootstrap, no manual installer download, no hardcoded
+      #   NVIDIA URL -- every install is manifest/CDN-driven through the action.
       - name: Install CUDA ${{ matrix.build_cuda }} via Jimver (config ${{ matrix.cfg }})
         if: matrix.install_method == 'jimver'
         uses: Jimver/cuda-toolkit@v0.2.36
@@ -342,174 +339,6 @@ jobs:
           cuda: ${{ matrix.build_cuda }}
           method: 'network'
 
-      - name: Install CUDA ${{ matrix.build_cuda }} via winget, manifest-resolved fallback (config ${{ matrix.cfg }})
-        if: matrix.install_method == 'winget'
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $id         = $env:WINGET_ID
-          $ver        = $env:WINGET_VERSION
-          $major      = $env:CUDA_MAJOR
-          $lastResort = $env:FALLBACK_INSTALLER
-          $cudaRoot   = 'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA'
-          Write-Host "installing CUDA line $ver (winget id: $id)"
-
-          # --- helpers ---------------------------------------------------------
-          function Get-ToolkitDir {
-            # Usable toolkit dir for this line: v<ver> with nvcc + the cuBLAS DLL.
-            $d = Join-Path $cudaRoot "v$ver"
-            if ((Test-Path (Join-Path $d "bin\nvcc.exe")) -and (Test-Path (Join-Path $d "bin\cublas64_$major.dll"))) { return $d } else { return $null }
-          }
-          function Find-Winget {
-            $c = Get-Command winget -ErrorAction SilentlyContinue
-            if ($c) { return $c.Source }
-            # A bootstrapped Appx winget may not be on this session's PATH yet;
-            # its shim has a fixed path under the Appx install root.
-            # NOTE: the Appx module CANNOT be loaded inside pwsh 7 on hosted
-            # runners ("Operation is not supported on this platform"), so every
-            # Appx probe goes through the system shell (powershell.exe), guarded.
-            try {
-              $loc = & powershell.exe -NoProfile -NonInteractive -Command `
-                'try { (Get-AppxPackage -Name Microsoft.DesktopAppInstaller).InstallLocation | Out-String } catch { "" }' 2>$null
-              if ($loc) {
-                $shim = Join-Path (($loc | Out-String).Trim()) "WinGet\Links\winget.exe"
-                if (Test-Path $shim) { return $shim }
-              }
-            } catch { }
-            return $null
-          }
-          function Get-ManifestInfo {
-            # The winget-pkgs manifest is the SAME source winget installs from:
-            # its URL + silent switches are always current when NVIDIA ships a
-            # patch, so a hardcoded download URL can never be stale here.
-            try {
-              $txt = (Invoke-WebRequest -UseBasicParsing "https://raw.githubusercontent.com/microsoft/winget-pkgs/master/manifests/n/Nvidia/CUDA/$ver/Nvidia.CUDA.installer.yaml").Content
-              $u   = [regex]::Match($txt, 'InstallerUrl:\s*(\S+)')
-              $sw  = [regex]::Match($txt, '^\s*Silent:\s*(\S.*)$', 'Multiline')
-              $sha = [regex]::Match($txt, 'InstallerSha256:\s*([0-9A-Fa-f]{64})')
-              if ($u.Success -and $u.Groups[1].Value -like 'https://developer.download.nvidia.com/*') {
-                return [pscustomobject]@{
-                  Url        = $u.Groups[1].Value
-                  SilentArgs = if ($sw.Success) { $sw.Groups[1].Value.Trim() -split '\s+' } else { @('-y', '-s', '-n') }
-                  Sha256     = if ($sha.Success) { $sha.Groups[1].Value } else { $null }
-                }
-              }
-            } catch {
-              Write-Host "  could not read winget-pkgs manifest: $($_.Exception.Message)"
-            }
-            return $null
-          }
-          function Install-CudaFromUrl {
-            param([string]$url, [string[]]$silentArgs)
-            Write-Host ("=== direct install: {0} ===" -f $url)
-            $exe = Join-Path $env:TEMP "cuda-installer.exe"
-            if (Test-Path $exe) { Remove-Item $exe -Force }
-            try {
-              Invoke-WebRequest -Uri $url -OutFile $exe -UseBasicParsing
-            } catch {
-              Write-Host "  download failed: $($_.Exception.Message)"
-              return $false
-            }
-            $sizeMb = (Get-Item $exe).Length / 1MB
-            Write-Host ("  downloaded: {0:N1} MB" -f $sizeMb)
-            # Sanity: stub ~10 MB, local ~4-6 GB. An error page saved as .exe is
-            # neither -- never execute that.
-            if ($sizeMb -lt 5 -or $sizeMb -gt 8000) {
-              Write-Host "  size out of range for a CUDA installer -- not running it"
-              return $false
-            }
-            $ia = @($silentArgs) + @('/norestart')
-            $p = Start-Process -FilePath $exe -ArgumentList $ia -Wait -PassThru
-            Write-Host "  installer exit code: $($p.ExitCode)"
-            Remove-Item $exe -Force -ErrorAction SilentlyContinue
-            return ($p.ExitCode -eq 0)
-          }
-
-          # --- 1. Locate winget; bootstrap the App Installer if absent ---------
-          # Hosted runners (Hosted Compute Agent lineage) ship NO winget, so the
-          # bootstrap is the normal path, not an edge case. On this runner
-          # generation the Appx module cannot load in pwsh 7, so the bootstrap
-          # script itself runs inside powershell.exe (Appx works there), passed
-          # as an EncodedCommand (base64: no quoting interaction at all).
-          $w = Find-Winget
-          if ($w) {
-            Write-Host "winget present: $w"
-          } else {
-            Write-Host "winget not on this image -- bootstrapping Microsoft.DesktopAppInstaller (Appx)"
-            # EncodedCommand = base64(UTF-16LE) of the bootstrap script (App Installer deps +
-            # bundle from winget-cli releases; downloads, expands deps .msix, adds them, adds
-            # the bundle, prints BOOTSTRAP-OK or BOOTSTRAP-ERR...). Pre-computed and embedded:
-            # a PS here-string terminator cannot sit inside a YAML block scalar. Refresh this
-            # blob only if the winget-cli release asset layout ever changes.
-            $enc = 'JABiAGEAcwBlACAAIAAgAD0AIAAnAGgAdAB0AHAAcwA6AC8ALwBnAGkAdABoAHUAYgAuAGMAbwBtAC8AbQBpAGMAcgBvAHMAbwBmAHQALwB3AGkAbgBnAGUAdAAtAGMAbABpAC8AcgBlAGwAZQBhAHMAZQBzAC8AbABhAHQAZQBzAHQALwBkAG8AdwBuAGwAbwBhAGQAJwAKACQAZABlAHAAcwAgACAAIAA9ACAASgBvAGkAbgAtAFAAYQB0AGgAIAAkAGUAbgB2ADoAVABFAE0AUAAgACcAZABhAGEAcABwAC0AZABlAHAAcwAuAHoAaQBwACcACgAkAGIAdQBuAGQAbABlACAAPQAgAEoAbwBpAG4ALQBQAGEAdABoACAAJABlAG4AdgA6AFQARQBNAFAAIAAnAGQAYQBhAHAAcAAuAG0AcwBpAHgAYgB1AG4AZABsAGUAJwAKACQAZABlAHAARABpAHIAIAA9ACAASgBvAGkAbgAtAFAAYQB0AGgAIAAkAGUAbgB2ADoAVABFAE0AUAAgACcAZABhAGEAcABwAC0AZABlAHAAcwAnAAoAdAByAHkAIAB7AAoAIAAgAEkAbgB2AG8AawBlAC0AVwBlAGIAUgBlAHEAdQBlAHMAdAAgAC0AVQByAGkAIAAoACQAYgBhAHMAZQAgACsAIAAnAC8ARABlAHMAawB0AG8AcABBAHAAcABJAG4AcwB0AGEAbABsAGUAcgBfAEQAZQBwAGUAbgBkAGUAbgBjAGkAZQBzAC4AegBpAHAAJwApACAALQBPAHUAdABGAGkAbABlACAAJABkAGUAcABzACAALQBVAHMAZQBCAGEAcwBpAGMAUABhAHIAcwBpAG4AZwAKACAAIABpAGYAIAAoAFQAZQBzAHQALQBQAGEAdABoACAAJABkAGUAcABEAGkAcgApACAAewAgAFIAZQBtAG8AdgBlAC0ASQB0AGUAbQAgACQAZABlAHAARABpAHIAIAAtAFIAZQBjAHUAcgBzAGUAIAAtAEYAbwByAGMAZQAgAH0ACgAgACAARQB4AHAAYQBuAGQALQBBAHIAYwBoAGkAdgBlACAALQBQAGEAdABoACAAJABkAGUAcABzACAALQBEAGUAcwB0AGkAbgBhAHQAaQBvAG4AUABhAHQAaAAgACQAZABlAHAARABpAHIACgAgACAAZgBvAHIAZQBhAGMAaAAgACgAJABkACAAaQBuACAAKABHAGUAdAAtAEMAaABpAGwAZABJAHQAZQBtACAAJABkAGUAcABEAGkAcgAgAC0ARgBpAGwAdABlAHIAIAAqAC4AbQBzAGkAeAApACkAIAB7AAoAIAAgACAAIABXAHIAaQB0AGUALQBIAG8AcwB0ACAAKAAnACAAIABBAGQAZAAtAEEAcABwAHgAUABhAGMAawBhAGcAZQAgAGQAZQBwADoAIAAnACAAKwAgACQAZAAuAE4AYQBtAGUAKQAKACAAIAAgACAAQQBkAGQALQBBAHAAcAB4AFAAYQBjAGsAYQBnAGUAIAAtAFAAYQB0AGgAIAAkAGQALgBGAHUAbABsAE4AYQBtAGUACgAgACAAfQAKACAAIABJAG4AdgBvAGsAZQAtAFcAZQBiAFIAZQBxAHUAZQBzAHQAIAAtAFUAcgBpACAAKAAkAGIAYQBzAGUAIAArACAAJwAvAE0AaQBjAHIAbwBzAG8AZgB0AC4ARABlAHMAawB0AG8AcABBAHAAcABJAG4AcwB0AGEAbABsAGUAcgBfADgAdwBlAGsAeQBiADMAZAA4AGIAYgB3AGUALgBtAHMAaQB4AGIAdQBuAGQAbABlACcAKQAgAC0ATwB1AHQARgBpAGwAZQAgACQAYgB1AG4AZABsAGUAIAAtAFUAcwBlAEIAYQBzAGkAYwBQAGEAcgBzAGkAbgBnAAoAIAAgAFcAcgBpAHQAZQAtAEgAbwBzAHQAIAAnACAAIABBAGQAZAAtAEEAcABwAHgAUABhAGMAawBhAGcAZQA6ACAATQBpAGMAcgBvAHMAbwBmAHQALgBEAGUAcwBrAHQAbwBwAEEAcABwAEkAbgBzAHQAYQBsAGwAZQByACAAYgB1AG4AZABsAGUAJwAKACAAIABBAGQAZAAtAEEAcABwAHgAUABhAGMAawBhAGcAZQAgAC0AUABhAHQAaAAgACQAYgB1AG4AZABsAGUACgAgACAAVwByAGkAdABlAC0ATwB1AHQAcAB1AHQAIAAnAEIATwBPAFQAUwBUAFIAQQBQAC0ATwBLACcACgB9ACAAYwBhAHQAYwBoACAAewAKACAAIABXAHIAaQB0AGUALQBPAHUAdABwAHUAdAAgACgAJwBCAE8ATwBUAFMAVABSAEEAUAAtAEUAUgBSACAAJwAgACsAIAAkAF8ALgBFAHgAYwBlAHAAdABpAG8AbgAuAE0AZQBzAHMAYQBnAGUAKQAKAH0ACgA='
-            try {
-              $out = & powershell.exe -NoProfile -NonInteractive -EncodedCommand $enc 2>&1
-              foreach ($o in @($out)) { Write-Host "  $o" }
-            } catch {
-              Write-Host "  appx bootstrap threw (expected on this runner generation): $($_.Exception.Message)"
-            }
-            for ($i = 0; $i -lt 10; $i++) {
-              $w = Find-Winget
-              if ($w) { break }
-              Start-Sleep -Seconds 3
-            }
-            if ($w) {
-              Write-Host "winget bootstrapped: $w"
-            } else {
-              Write-Host "winget unavailable on this runner -- going straight to the direct installer"
-            }
-          }
-
-          # --- 2. Resolve installer URL + flags from the winget manifest -------
-          $mf = Get-ManifestInfo
-          if ($mf) {
-            Write-Host ("winget-pkgs manifest ($ver) pins: {0}" -f $mf.Url)
-            Write-Host ("  silent args: {0}   sha256: {1}" -f (($mf.SilentArgs -join ' '), $mf.Sha256))
-          }
-
-          # --- 3. PRIMARY: winget install (line-wide match; no --exact, so a
-          #          future 13.4.x manifest bump still resolves) -----------------
-          if ($w) {
-            $wlog = Join-Path $env:TEMP "winget-install.log"
-            Write-Host "--- winget install --id $id --version $ver ---"
-            & $w install --id $id --version $ver --silent `
-                  --accept-package-agreements --accept-source-agreements *> $wlog
-            $wrc = $LASTEXITCODE
-            Write-Host "----- winget log (exit=$wrc) -----"
-            Get-Content $wlog -ErrorAction SilentlyContinue
-          } else {
-            Write-Host "winget unavailable; skipping to direct installer"
-          }
-
-          # --- 4. FALLBACK: direct download+install, manifest URL first --------
-          # Only reached when the winget path left no usable toolkit, so a bad
-          # URL can never break an otherwise-good run.
-          $have = Get-ToolkitDir
-          if (-not $have -and $mf) {
-            Install-CudaFromUrl -Url $mf.Url -SilentArgs $mf.SilentArgs | Out-Null
-            $have = Get-ToolkitDir
-          }
-          if (-not $have) {
-            Write-Host "last-resort URL (pinned, matrix): $lastResort"
-            Install-CudaFromUrl -Url $lastResort -SilentArgs @('-y', '-gm2', '-s', '-n') | Out-Null
-            $have = Get-ToolkitDir
-          }
-
-          # --- 5. Verify --------------------------------------------------------
-          if (-not $have) {
-            Write-Host "FAIL: usable CUDA toolkit not found under $cudaRoot (need bin\nvcc.exe + bin\cublas64_$major.dll in a v$ver dir)"
-            if (Test-Path $cudaRoot) {
-              Write-Host "installed toolkit versions present:"
-              Get-ChildItem $cudaRoot | ForEach-Object { Write-Host "  $($_.Name)" }
-            } else {
-              Write-Host "  (no CUDA toolkit directory at all)"
-            }
-            throw "CUDA $ver install failed -- see the winget log section above for the primary-path failure"
-          }
-          Write-Host "=== CUDA $ver toolkit verified at $have ==="
-          Set-Content -Path $env:GITHUB_ENV -Value "CUDA_PATH=$have"
-          & "$have\bin\nvcc.exe" --version
-          Write-Host ("cublas: {0:N1} MB" -f ((Get-Item (Join-Path $have "bin\cublas64_$major.dll")).Length / 1MB))
       - name: Install Ninja
         uses: seanmiddleditch/gha-setup-ninja@v5
 
@@ -537,8 +366,8 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $label   = $env:UPSTREAM_VERSION_LABEL
           if (-not $label) { $label = ($env:UPSTREAM_SHA).Substring(0,12) }
-          $cu      = $env:HOST_CUDA    # e.g. 12.9 / 13.4 -> zip suffix + launcher
-          $envVar  = $env:HOST_ENV     # e.g. CUDA_PATH_V12_9 / CUDA_PATH_V13_4
+          $cu      = $env:HOST_CUDA    # e.g. 12.9 / 13.3 -> zip suffix + launcher
+          $envVar  = $env:HOST_ENV     # e.g. CUDA_PATH_V12_9 / CUDA_PATH_V13_3
           $example = 'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v' + $cu
 
           New-Item -ItemType Directory -Force -Path dist\slim | Out-Null
@@ -658,7 +487,7 @@ jobs:
             printf 'Each config ships two zips:\n'
             printf '  - **slim** (no `-cublas`): relies on your system CUDA toolkit. `whisper.bat`\n'
             printf '    puts the toolkit bin first on PATH (via the config host env var, e.g.\n'
-            printf '    `%%CUDA_PATH_V12_9%%` / `%%CUDA_PATH_V13_4%%`) so cuBLAS loads from that install.\n'
+            printf '    `%%CUDA_PATH_V12_9%%` / `%%CUDA_PATH_V13_3%%`) so cuBLAS loads from that install.\n'
             printf '    If the env var is unset it prints exactly what to set and exits.\n'
             printf '  - **cublas** (`-cublas` suffix): bundles `cublas*.dll` for machines without CUDA.\n'
             printf '\n'
@@ -675,11 +504,11 @@ jobs:
           ### turing-cuda12.9 -- RTX 2060 / 2070 / 2080 / Titan Xp (Turing sm_75)
           - CUDA 12.9 (Jimver/cuda-toolkit), `-DCMAKE_CUDA_ARCHITECTURES=75`.
           - Host launcher uses `CUDA_PATH_V12_9`.
-          ### ada-cuda13.4 -- RTX 4060 (Ada sm_89)
-          - Built against CUDA 13.4 (installed on the runner from the winget
-            winget-pkgs manifest, with the NVIDIA network installer as a fallback);
-            runs on the 4060's own CUDA 13.4 host.
-          - `-DCMAKE_CUDA_ARCHITECTURES=89`; host launcher uses `CUDA_PATH_V13_4`.
+          ### ada-cuda13.3 -- RTX 4060 (Ada sm_89)
+          - Built against CUDA 13.3 (installed on the runner via Jimver/cuda-toolkit,
+            method: network -- the same route-and-source as the 12.9 lane);
+            runs on the 4060's own CUDA 13.x host.
+          - `-DCMAKE_CUDA_ARCHITECTURES=89`; host launcher uses `CUDA_PATH_V13_3`.
 
           ## Common build notes (all configs)
           - `GGML_STATIC=ON` => cudart statically linked (no `cudart64_*.dll` needed) -- verified in CI.
