@@ -94,8 +94,8 @@ foreach ($l in $targetLines) {
 $targets = @($targets | Sort-Object -Unique)
 $ttxt = if ($targets.Count -gt 0) { $targets -join ', ' } else { '(none parseable)' }
 Write-Host "  arch targets in SASS: $ttxt"
-if (-not ($targets -match [regex]::Escape("^$sm$"))) { throw "$sm NOT present in SASS targets: $ttxt" }
-$foreign = @($targets | Where-Object { $_ -notmatch [regex]::Escape("^$sm$") })
+if ($targets -notcontains $sm) { throw "$sm NOT present in SASS targets: $ttxt" }
+$foreign = @($targets | Where-Object { $_ -ne $sm })
 if ($foreign.Count -gt 0) { Write-Host "  NOTE: non-$sm archs also present: $($foreign -join ', ')" }
 Write-Host "  $sm SASS: OK (and NO other GPU generation)"
 
