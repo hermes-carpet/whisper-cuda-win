@@ -1,6 +1,8 @@
 # Auto-build whisper.cpp (whisper-cli) for a set of GPU/CUDA configs on Windows,
 # and publish ONE GitHub Release (tagged by the upstream version label) containing
-# one pair of zips per config, whenever upstream ggml-org/whisper.cpp (master) moves.
+# one pair of zips per config. Rebuild is gated on the upstream VERSION NUMBER
+# (WHISPER_VERSION_MAJOR.MINOR.PATCH from whisper.cpp's CMakeLists.txt) -- it ONLY
+# fires when that number changes, not on every master commit.
 #
 # A "config" = one row of the build-windows matrix. To support a new GPU/CUDA combo,
 # add one row there -- everything (naming, launcher env var, zip suffix, artifact
@@ -36,16 +38,18 @@
 # 13.3 keeps the runtime DLL in bin\ (like 12.9), so the whole path is
 # unblocked with the same route the working lane already uses.
 #
-# State: `upstream-sha` (repo root) = last published upstream SHA. The commit-sha
-# job self-commits it back -- the llama-slim keepalive pattern.
-# Cadence: weekly (Tue 09:00 UTC) poll + manual workflow_dispatch.
+# State: `upstream-sha` (repo root) = last PUBLISHED upstream version (as a SHA).
+# The commit-sha job self-commits it back -- the llama-slim keepalive pattern.
+# Cadence: weekly (Tue 09:00 UTC) poll + manual workflow_dispatch. A poll only
+# rebuilds when the upstream version changed; otherwise it exits fast (no build).
 
 name: auto-rebuild-on-upstream
 
 on:
   schedule:
-    # Weekly, Tuesday 09:00 UTC: poll ggml-org/whisper.cpp master for commits
-    # newer than upstream-sha; if none, exits fast with no build.
+    # Weekly, Tuesday 09:00 UTC: poll ggml-org/whisper.cpp master. Rebuild ONLY if
+    # the upstream version number (CMakeLists WHISPER_VERSION) changed vs the last
+    # published build; otherwise exits fast with no build.
     - cron: '0 9 * * 2'
   workflow_dispatch:
     inputs:
@@ -54,7 +58,7 @@ on:
         required: false
         default: ''
       force:
-        description: 'Rebuild even if SHA already published'
+        description: 'Rebuild even if the upstream version is already published'
         required: false
         default: 'false'
         type: choice
@@ -109,38 +113,22 @@ jobs:
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
           echo "Upstream master: $sha"
 
-      - name: Compare with published SHA
-        id: check
-        run: |
-          set -euo pipefail
-          latest="${{ steps.latest.outputs.sha }}"
-          explicit="${{ inputs.upstream_sha }}"
-          force="${{ inputs.force }}"
-          if [ -n "$explicit" ]; then latest="$explicit"; fi
-          current=$(cat upstream-sha 2>/dev/null || echo "")
-          echo "published_sha=${current:-<none>}"
-          echo "candidate_sha=$latest"
-          if [ "$latest" = "$current" ] && [ "$force" != "true" ]; then
-            echo "changed=false" >> "$GITHUB_OUTPUT"
-            echo "build_sha=" >> "$GITHUB_OUTPUT"
-            echo "Already published, nothing to do."
-          else
-            echo "changed=true" >> "$GITHUB_OUTPUT"
-            echo "build_sha=$latest" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Resolve upstream version (human-readable) for release naming
+      - name: Resolve upstream version (SemVer number + release label) for this master
         id: version
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           # whisper.cpp keeps its SemVer in CMakeLists.txt (WHISPER_VERSION_MAJOR
-          # / MINOR / PATCH). Label used for the tag/title/asset filenames:
-          #   "<X.Y.Z>"     when the commit is exactly the upstream vX.Y.Z tag
-          #   "<X.Y.Z>-dev" when it is a master commit between tags
+          # / MINOR / PATCH). `version` is the bare number (the TRIGGER key);
+          # `version_label` is the human-readable name used for tag/title/assets:
+          #   "<X.Y.Z>"     when master HEAD is exactly the upstream vX.Y.Z tag
+          #   "<X.Y.Z>-dev" when master is a post-tag development commit
           #   "<sha12>"     fallback if the version cannot be resolved
-          sha="${{ steps.check.outputs.build_sha }}"
+          latest="${{ steps.latest.outputs.sha }}"
+          explicit="${{ inputs.upstream_sha }}"
+          [ -n "$explicit" ] && latest="$explicit"
+          sha="$latest"
           v=""
           if [ -n "$sha" ]; then
             # raw.githubusercontent.com is PUBLIC -- no token needed.
@@ -175,7 +163,41 @@ jobs:
           fi
           echo "version=${v}" >> "$GITHUB_OUTPUT"
           echo "version_label=${label}" >> "$GITHUB_OUTPUT"
-          echo "Resolved label: ${label} (version=${v:-<none>}, sha=${sha:0:12})"
+          echo "build_sha_out=${sha}" >> "$GITHUB_OUTPUT"
+          echo "Resolved: version=${v:-<none>} label=${label} sha=${sha:0:12}"
+
+      - name: Compare upstream VERSION with last published (number-only gate)
+        id: check
+        run: |
+          set -euo pipefail
+          candidate="${{ steps.version.outputs.version }}"
+          force="${{ inputs.force }}"
+          # upstream-sha = last PUBLISHED build's master head (a SHA). Map it to a
+          # version number the same way `version` does, so the gate compares
+          # version-to-version. If the state file is missing/empty (first run) or
+          # its SHA's version can't be resolved, treat as "no prior version" and
+          # build.
+          published_sha=$(cat upstream-sha 2>/dev/null || echo "")
+          published_version=""
+          if [ -n "$published_sha" ]; then
+            pcm=$(curl -fsSL \
+                  "https://raw.githubusercontent.com/ggml-org/whisper.cpp/${published_sha}/CMakeLists.txt" || echo "")
+            pmaj=$(printf '%s\n' "$pcm" | sed -nE 's/^set\(WHISPER_VERSION_MAJOR ([0-9]+).*/\1/p' | head -1)
+            pmin=$(printf '%s\n' "$pcm" | sed -nE 's/^set\(WHISPER_VERSION_MINOR ([0-9]+).*/\1/p' | head -1)
+            ppat=$(printf '%s\n' "$pcm" | sed -nE 's/^set\(WHISPER_VERSION_PATCH ([0-9]+).*/\1/p' | head -1)
+            [ -n "${pmaj}${pmin}${ppat}" ] && published_version="${pmaj}.${pmin}.${ppat}"
+          fi
+          echo "published_sha=${published_sha:-<none>} (version ${published_version:-<unresolved>})"
+          echo "candidate_version=${candidate:-<unresolved>}"
+          if [ -n "$candidate" ] && [ "$candidate" = "$published_version" ] && [ "$force" != "true" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "build_sha=" >> "$GITHUB_OUTPUT"
+            echo "Upstream version unchanged (${candidate}); nothing to rebuild."
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "build_sha=${{ steps.version.outputs.build_sha_out }}" >> "$GITHUB_OUTPUT"
+            echo "Version change: ${published_version:-<none>} -> ${candidate:-<unresolved>}; building."
+          fi
 
   # build-cpu: CPU-only build of the same commit + real jfk.wav transcription.
   # Runs ONCE (config-independent) -- the executable smoke test proving the sources
