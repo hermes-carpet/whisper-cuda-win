@@ -390,7 +390,8 @@ jobs:
             '  echo [whisper-cuda]   Fix: set __ENVVAR__ to your CUDA __CU__ install dir,'
             '  echo [whisper-cuda]   e.g. __EXAMPLE__ (the CUDA __CU__ toolkit normally sets this) and re-run.'
             ') else ('
-            '  set "PATH=%__ENVVAR__%\bin;%PATH%"'
+            '  rem 12.x runtime in %__ENVVAR__%\bin, 13.x in %__ENVVAR__%\bin\x64 -- add both'
+            '  set "PATH=%__ENVVAR__%\bin;%__ENVVAR__%\bin\x64;%PATH%"'
             ')'
             '"%~dp0whisper-cli.exe" %*'
           )
@@ -400,9 +401,19 @@ jobs:
           # Slim zip: exe + ggml/whisper DLLs + launcher. cuBLAS from system CUDA $cu.
           Compress-Archive -Path dist\slim\* -DestinationPath "whisper-cli-$label-win-cuda$cu.zip" -Force
           # Portable zip: same, but bundle cuBLAS (cublas*.dll) from the toolkit bin.
+          # CUDA 12.x puts the cuBLAS runtime DLLs in bin\; CUDA 13.x NVIDIA moves
+          # them to bin\x64. Gather from BOTH so the -cublas package is complete
+          # whatever the host's layout is.
           New-Item -ItemType Directory -Force -Path dist\full | Out-Null
           Copy-Item dist\slim\* dist\full\ -Force
-          Get-ChildItem "$env:CUDA_PATH\bin" -Filter 'cublas*.dll' | ForEach-Object { Copy-Item $_.FullName dist\full\ -Force }
+          $cubFrom = @()
+          foreach ($dir in @("$env:CUDA_PATH\bin", "$env:CUDA_PATH\bin\x64")) {
+            if (Test-Path $dir) { $cubFrom += @(Get-ChildItem $dir -Filter 'cublas*.dll' -ErrorAction SilentlyContinue) }
+          }
+          $cubFrom = @($cubFrom | Sort-Object FullName -Unique)
+          if (-not $cubFrom.Count) { throw "no cublas*.dll in $env:CUDA_PATH\bin or \bin\x64 - cannot build the portable -cublas package" }
+          $cubFrom | ForEach-Object { Write-Host ("  bundle cuBLAS: {0}" -f $_.Name) }
+          $cubFrom | ForEach-Object { Copy-Item $_.FullName dist\full\ -Force }
           Compress-Archive -Path dist\full\* -DestinationPath "whisper-cli-$label-win-cuda$cu-cublas.zip" -Force
 
           Write-Host "=== release zips (config $env:CFG, label=$label, cuda$cu) ==="

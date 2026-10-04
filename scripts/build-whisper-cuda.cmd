@@ -94,13 +94,17 @@ if defined CUDA_PATH goto :have_cuda
 goto :err_no_cuda
 
 :have_cuda
-set "PATH=%CUDA_PATH%\bin;%PATH%"
+rem CUDA 12.x puts runtime DLLs in bin\; CUDA 13.x moves them to bin\x64.
+rem Add BOTH to PATH and check both so one script serves either layout.
+set "PATH=%CUDA_PATH%\bin;%CUDA_PATH%\bin\x64;%PATH%"
 if exist "%CUDA_PATH%\bin\cudart64_%CUDA_MAJOR%.dll" goto :have_cudart
+if exist "%CUDA_PATH%\bin\x64\cudart64_%CUDA_MAJOR%.dll" goto :have_cudart
 goto :err_no_cudart
 
 :have_cudart
 echo [cuda] using CUDA_PATH = %CUDA_PATH%
 if exist "%CUDA_PATH%\bin\cublas64_%CUDA_MAJOR%.dll" goto :have_cublas
+if exist "%CUDA_PATH%\bin\x64\cublas64_%CUDA_MAJOR%.dll" goto :have_cublas
 goto :err_no_cublas
 
 :have_cublas
