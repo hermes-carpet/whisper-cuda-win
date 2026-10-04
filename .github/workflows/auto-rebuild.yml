@@ -480,8 +480,26 @@ jobs:
           fi
 
           tag="whisper-${label}"
-          # idempotent: a prior (force) run may already have created this tag.
-          gh api -X DELETE "repos/${{ github.repository }}/releases/tags/${tag}" >/dev/null 2>&1 || true
+          # idempotent: replace a prior (force) run that already created this tag.
+          # Do NOT use a bare `|| true`: if DELETE fails transiently (rate limit /
+          # API flake) the tag survives and the POST below 422s with
+          # "tag_name already_exists". Retry DELETE until the tag is verifiably
+          # gone (GET 404s), with a bound so a real error still fails the step.
+          for attempt in 1 2 3 4 5; do
+            # A missing tag/release means the GET 404s -- that's the success condition.
+            if gh api -q . "repos/${{ github.repository }}/releases/tags/${tag}" >/dev/null 2>&1; then
+              # release exists -- delete it
+              gh api -X DELETE "repos/${{ github.repository }}/releases/tags/${tag}" >/dev/null 2>&1 || true
+            fi
+            # verify it's really gone
+            if ! gh api -q . "repos/${{ github.repository }}/releases/tags/${tag}" >/dev/null 2>&1; then
+              echo "tag ${tag} is free (delete verified on attempt ${attempt})"
+              break
+            fi
+            echo "tag ${tag} still present after attempt ${attempt}; retrying in 15s"
+            [ "${attempt}" -ge 5 ] && { echo "ERROR: could not clear existing tag ${tag} for release"; exit 1; }
+            sleep 15
+          done
 
           # --- Build the release body ----------------------------------------
           TOP_LINE="whisper-cli \`${label}\` from \`ggml-org/whisper.cpp\` -- Windows 10 GPU builds."
